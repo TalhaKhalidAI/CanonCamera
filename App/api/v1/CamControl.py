@@ -543,3 +543,43 @@ async def test_endpoint():
             {"path": "/dslr/select", "method": "GET", "desc": "Web interface"}
         ]
     }
+@cam_route.get("/health")
+async def camera_health():
+    """Check if camera is properly connected and working"""
+    try:
+        if not clsr or not clsr.camera:
+            return {
+                "status": "unhealthy",
+                "message": "Camera not connected",
+                "timestamp": time.time()
+            }
+        
+        # Quick test capture
+        try:
+            # Try to get preview to verify camera is responsive
+            import gphoto2 as gp
+            camera_file = gp.CameraFile()
+            clsr.camera.capture_preview(camera_file, clsr.context)
+            file_data = camera_file.get_data_and_size()
+            
+            return {
+                "status": "healthy",
+                "camera_model": clsr.camera_model,
+                "port": clsr.selected_port,
+                "preview_size": len(file_data),
+                "timestamp": time.time()
+            }
+        except Exception as e:
+            return {
+                "status": "unhealthy",
+                "message": f"Camera not responding: {str(e)}",
+                "timestamp": time.time()
+            }
+            
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return {
+            "status": "error",
+            "message": str(e),
+            "timestamp": time.time()
+        }
