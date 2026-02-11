@@ -5,10 +5,12 @@ import threading
 import time
 from queue import Queue, Empty
 import logging
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 import subprocess
 import re
 import os
+from datetime import datetime
+import json
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -739,6 +741,550 @@ class CameraLiveViewStreamer:
         except Exception as e:
             logger.error(f"Capture error: {e}")
             raise
+
+    def cleanup(self):
+        """Clean up resources"""
+        logger.info("Cleaning up camera streamer...")
+        self.stop_streaming()
+        
+        # Clean up context
+        if self.context:
+            # Note: gphoto2 Python bindings don't require explicit context cleanup
+            self.context = None
+        
+        logger.info("Camera streamer cleanup complete")
+    def _safe_camera_cleanup(self):
+            """Safely clean up camera resources"""
+            try:
+                if self.camera:
+                    # Exit camera if initialized
+                    if self.is_initialized:
+                        try:
+                            self.camera.exit(self.context)
+                            logger.info("Camera exited successfully")
+                        except Exception as e:
+                            logger.warning(f"Error exiting camera: {e}")
+                    
+                    self.camera = None
+                    self.is_initialized = False
+                    
+            except Exception as e:
+                logger.error(f"Error in camera cleanup: {e}")
+            finally:
+                self.camera = None
+                self.is_initialized = False
+    
+    # ============================================
+    # SD CARD ACCESS FUNCTIONS
+    # ============================================
+    
+    def list_sd_card_contents(self, folder: str = "/") -> List[Dict]:
+        """
+        List all files and directories on the camera's SD card.
+        
+        Args:
+            folder: Path to list (default is root "/")
+            
+        Returns:
+            List of dictionaries containing file/directory info
+        """
+        try:
+            with self.lock:
+                if not self.camera or not self.is_initialized:
+                    raise Exception("Camera not initialized. Connect to camera first.")
+                
+                contents = []
+                
+                # List files in the folder
+                try:
+                    files = self.camera.folder_list_files(folder, self.context)
+                    for file_info in files:
+                        # Get file size if possible
+                        size_bytes = 0
+                        try:
+                            camera_file = gp.CameraFile()
+                            self.camera.file_get(
+                                folder,
+                                file_info.name,
+                                gp.GP_FILE_TYPE_NORMAL,
+                                camera_file,
+                                self.context
+                            )
+                            file_data = camera_file.get_data_and_size()
+                            size_bytes = len(file_data)
+                        except:
+                            size_bytes = 0
+                        
+                        # Determine file type
+                        file_name = str(file_info.name)  # Ensure it's a string
+                        if '.' in file_name:
+                            file_ext = file_name.lower().split('.')[-1]
+                        else:
+                            file_ext = ''
+                            
+                        if file_ext in ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'tif']:
+                            file_type = "image"
+                        elif file_ext in ['cr2', 'nef', 'arw', 'dng']:
+                            file_type = "raw"
+                        elif file_ext in ['mp4', 'avi', 'mov', 'mkv']:
+                            file_type = "video"
+                        else:
+                            file_type = "file"
+                        
+                        contents.append({
+                            'name': file_name,
+                            'type': file_type,
+                            'size': size_bytes,
+                            'size_formatted': self._format_file_size(size_bytes),
+                            'path': f"{folder}/{file_name}",
+                            'folder': folder,
+                            'extension': file_ext,
+                            'is_file': True
+                        })
+                except Exception as e:
+                    logger.warning(f"Could not list files in {folder}: {e}")
+                
+                # List folders
+                try:
+                    folders = self.camera.folder_list_folders(folder, self.context)
+                    for folder_name in folders:
+                        contents.append({
+                            'name': str(folder_name),  # Ensure it's a string
+                            'type': "folder",
+                            'size': 0,
+                            'size_formatted': "-",
+                            'path': f"{folder}/{folder_name}",
+                            'folder': folder,
+                            'extension': "",
+                            'is_file': False
+                        })
+                except Exception as e:
+                    logger.warning(f"Could not list folders in {folder}: {e}")
+                
+                # Sort contents: folders first, then files alphabetically
+                contents.sort(key=lambda x: (not x['is_file'], x['name'].lower()))
+                
+                logger.info(f"Listed {len(contents)} items from SD card folder: {folder}")
+                return contents
+                
+        except Exception as e:
+            logger.error(f"Error listing SD card contents: {e}")
+            raise
+ 
+    
+    def search_images(self, 
+                     folder: str = "/", 
+                     recursive: bool = True,
+                     extensions: List[str] = None) -> List[Dict]:
+        """
+        Search for images on the SD card.
+        
+        Args:
+            folder: Starting folder path
+            recursive: Whether to search subfolders
+            extensions: List of file extensions to include (default: common image formats)
+            
+        Returns:
+            List of image file information dictionaries
+        """
+        try:
+            with self.lock:
+                if not self.camera or not self.is_initialized:
+                    raise Exception("Camera not initialized. Connect to camera first.")
+                
+                if extensions is None:
+                    extensions = ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'tif', 'cr2', 'nef', 'arw', 'dng']
+                
+                images = []
+                folders_to_search = [folder]
+                searched_folders = set()
+                
+                while folders_to_search:
+                    current_folder = folders_to_search.pop(0)
+                    
+                    # Avoid infinite loops
+                    if current_folder in searched_folders:
+                        continue
+                    searched_folders.add(current_folder)
+                    
+                    try:
+                        contents = self.list_sd_card_contents(current_folder)
+                        
+                        for item in contents:
+                            if item['is_file']:
+                                # Check if file has image extension
+                                ext = item.get('extension', '').lower()
+                                if ext in extensions:
+                                    # Try to get more metadata if it's an image
+                                    metadata = self._get_image_metadata(current_folder, item['name'])
+                                    item.update(metadata)
+                                    images.append(item)
+                            elif recursive and item['type'] == 'folder':
+                                # Add subfolder to search list
+                                folders_to_search.append(item['path'])
+                    except Exception as e:
+                        logger.warning(f"Could not search folder {current_folder}: {e}")
+                
+                # Sort images by name (which often includes timestamp)
+                images.sort(key=lambda x: x['name'].lower(), reverse=True)
+                
+                logger.info(f"Found {len(images)} images in search")
+                return images
+                
+        except Exception as e:
+            logger.error(f"Error searching images: {e}")
+            raise
+    
+    def download_image(self, folder: str, filename: str) -> Tuple[bytes, str, Dict]:
+        """
+        Download a specific image from the camera's SD card.
+        
+        Args:
+            folder: Folder path on camera
+            filename: Name of the file to download
+            
+        Returns:
+            Tuple of (file_data, suggested_filename, metadata)
+        """
+        try:
+            with self.lock:
+                if not self.camera or not self.is_initialized:
+                    raise Exception("Camera not initialized. Connect to camera first.")
+                
+                # Ensure filename is string
+                filename = str(filename)
+                logger.info(f"Downloading image: {folder}/{filename}")
+                
+                # Download the file
+                camera_file = gp.CameraFile()
+                self.camera.file_get(
+                    folder,
+                    filename,
+                    gp.GP_FILE_TYPE_NORMAL,
+                    camera_file,
+                    self.context
+                )
+                
+                # Get file data
+                file_data = camera_file.get_data_and_size()
+                
+                # Get metadata
+                metadata = self._get_image_metadata(folder, filename)
+                
+                # Get file info for size
+                metadata['size_bytes'] = len(file_data)
+                metadata['size_formatted'] = self._format_file_size(len(file_data))
+                
+                # Determine suggested filename
+                # Use original filename but sanitize it
+                safe_filename = self._sanitize_filename(filename)
+                
+                logger.info(f"Successfully downloaded {filename} ({metadata['size_formatted']})")
+                return file_data, safe_filename, metadata
+                
+        except Exception as e:
+            logger.error(f"Error downloading image {folder}/{filename}: {e}")
+            raise
+    
+    def download_image_by_path(self, file_path: str) -> Tuple[bytes, str, Dict]:
+        """
+        Download an image by full path.
+        
+        Args:
+            file_path: Full path to file (e.g., "/DCIM/100CANON/image.jpg")
+            
+        Returns:
+            Tuple of (file_data, suggested_filename, metadata)
+        """
+        try:
+            # Extract folder and filename from path
+            if '/' in file_path:
+                folder = os.path.dirname(file_path)
+                filename = os.path.basename(file_path)
+            else:
+                folder = "/"
+                filename = file_path
+            
+            return self.download_image(folder, filename)
+            
+        except Exception as e:
+            logger.error(f"Error downloading image by path {file_path}: {e}")
+            raise
+    
+    def download_multiple_images(self, file_list: List[Dict]) -> List[Dict]:
+        """
+        Download multiple images at once.
+        
+        Args:
+            file_list: List of dictionaries with 'folder' and 'filename' keys
+            
+        Returns:
+            List of download results
+        """
+        try:
+            results = []
+            
+            for i, file_info in enumerate(file_list):
+                try:
+                    folder = file_info.get('folder', '/')
+                    filename = file_info.get('filename')
+                    
+                    if not filename:
+                        logger.warning(f"Missing filename in item {i}")
+                        results.append({
+                            'success': False,
+                            'error': 'Missing filename',
+                            'original_path': file_info
+                        })
+                        continue
+                    
+                    # Ensure filename is string
+                    filename = str(filename)
+                    logger.info(f"Downloading {i+1}/{len(file_list)}: {folder}/{filename}")
+                    
+                    file_data, suggested_name, metadata = self.download_image(folder, filename)
+                    
+                    results.append({
+                        'success': True,
+                        'original_path': f"{folder}/{filename}",
+                        'suggested_filename': suggested_name,
+                        'size_bytes': len(file_data),
+                        'size_formatted': metadata['size_formatted'],
+                        'metadata': metadata,
+                        'data': file_data  # Note: might be large, consider saving to disk instead
+                    })
+                    
+                except Exception as e:
+                    logger.error(f"Failed to download {file_info}: {e}")
+                    results.append({
+                        'success': False,
+                        'original_path': str(file_info),
+                        'error': str(e)
+                    })
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error downloading multiple images: {e}")
+            raise
+    
+    def delete_image(self, folder: str, filename: str) -> bool:
+        """
+        Delete an image from the camera's SD card.
+        
+        Args:
+            folder: Folder path on camera
+            filename: Name of the file to delete
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with self.lock:
+                if not self.camera or not self.is_initialized:
+                    raise Exception("Camera not initialized. Connect to camera first.")
+                
+                # Ensure filename is string
+                filename = str(filename)
+                logger.warning(f"Deleting image from camera: {folder}/{filename}")
+                
+                # Delete the file
+                self.camera.file_delete(folder, filename, self.context)
+                
+                logger.info(f"Successfully deleted {folder}/{filename}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error deleting image {folder}/{filename}: {e}")
+            return False
+    
+    def get_image_thumbnail(self, folder: str, filename: str, 
+                           max_width: int = 320, max_height: int = 240) -> bytes:
+        """
+        Get a thumbnail version of an image.
+        
+        Args:
+            folder: Folder path on camera
+            filename: Name of the file
+            max_width: Maximum thumbnail width
+            max_height: Maximum thumbnail height
+            
+        Returns:
+            Thumbnail image data as JPEG bytes
+        """
+        try:
+            # Ensure filename is string
+            filename = str(filename)
+            
+            # Download the full image
+            file_data, _, _ = self.download_image(folder, filename)
+            
+            # Try to decode and create thumbnail
+            try:
+                img_array = np.frombuffer(file_data, dtype=np.uint8)
+                img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                
+                if img is not None:
+                    # Create thumbnail
+                    height, width = img.shape[:2]
+                    
+                    # Calculate aspect ratio
+                    if width > height:
+                        new_width = min(max_width, width)
+                        new_height = int(height * (new_width / width))
+                    else:
+                        new_height = min(max_height, height)
+                        new_width = int(width * (new_height / height))
+                    
+                    # Resize
+                    thumbnail = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
+                    
+                    # Encode as JPEG
+                    _, thumbnail_data = cv2.imencode('.jpg', thumbnail, 
+                                                    [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    
+                    return thumbnail_data.tobytes()
+                
+            except Exception as decode_error:
+                logger.warning(f"Could not decode image for thumbnail: {decode_error}")
+            
+            # If we can't create thumbnail, return a placeholder
+            return self._create_thumbnail_placeholder(filename, max_width, max_height)
+            
+        except Exception as e:
+            logger.error(f"Error getting thumbnail for {folder}/{filename}: {e}")
+            # Return placeholder on error
+            return self._create_thumbnail_placeholder(filename, max_width, max_height)
+    
+    def _get_image_metadata(self, folder: str, filename: str) -> Dict:
+        """
+        Extract metadata from an image file.
+        
+        Args:
+            folder: Folder path on camera
+            filename: Name of the file
+            
+        Returns:
+            Dictionary with metadata
+        """
+        metadata = {
+            'filename': filename,
+            'folder': folder,
+            'full_path': f"{folder}/{filename}",
+            'file_type': 'unknown',
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        try:
+            # Ensure filename is string
+            filename = str(filename)
+            
+            # Download a small portion to check file type
+            camera_file = gp.CameraFile()
+            self.camera.file_get(
+                folder,
+                filename,
+                gp.GP_FILE_TYPE_NORMAL,
+                camera_file,
+                self.context
+            )
+            
+            # Get first few bytes to detect file type
+            file_data = camera_file.get_data_and_size()
+            
+            # Check file magic bytes
+            magic = file_data[:4] if len(file_data) >= 4 else b''
+            magic_hex = magic.hex()
+            
+            if file_data[:2] == b'\xff\xd8':
+                metadata['file_type'] = 'jpeg'
+            elif magic == b'\x89PNG':
+                metadata['file_type'] = 'png'
+            elif magic == b'BM':
+                metadata['file_type'] = 'bmp'
+            elif magic in [b'II\x2a\x00', b'MM\x00\x2a']:
+                if filename.lower().endswith('.cr2'):
+                    metadata['file_type'] = 'cr2'
+                else:
+                    metadata['file_type'] = 'tiff'
+            elif magic_hex.startswith('4e494b4f4e'):  # NIKON
+                metadata['file_type'] = 'nef'
+            elif magic_hex.startswith('49492a00') and filename.lower().endswith('.arw'):
+                metadata['file_type'] = 'arw'
+            
+            # Extract timestamp from filename (common pattern)
+            try:
+                # Look for patterns like IMG_20231225_123456.jpg
+                date_patterns = [
+                    r'(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})',
+                    r'IMG_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})',
+                    r'DSC_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})'
+                ]
+                
+                for pattern in date_patterns:
+                    match = re.search(pattern, filename)
+                    if match:
+                        year, month, day, hour, minute, second = match.groups()
+                        metadata['timestamp'] = f"{year}-{month}-{day}T{hour}:{minute}:{second}"
+                        break
+            except:
+                pass
+            
+        except Exception as e:
+            logger.debug(f"Could not extract metadata for {filename}: {e}")
+        
+        return metadata
+    
+    def _format_file_size(self, size_bytes: int) -> str:
+        """Format file size in human-readable format"""
+        if size_bytes == 0:
+            return "0 B"
+            
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size_bytes < 1024.0:
+                return f"{size_bytes:.1f} {unit}"
+            size_bytes /= 1024.0
+        return f"{size_bytes:.1f} TB"
+    
+    def _sanitize_filename(self, filename: str) -> str:
+        """Sanitize filename for safe downloading"""
+        # Ensure it's a string
+        filename = str(filename)
+        
+        # Remove any path components
+        filename = os.path.basename(filename)
+        
+        # Replace or remove problematic characters
+        problematic_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
+        for char in problematic_chars:
+            filename = filename.replace(char, '_')
+        
+        # Ensure filename is not empty
+        if not filename:
+            filename = f"image_{int(time.time())}.jpg"
+        
+        return filename
+    
+    def _create_thumbnail_placeholder(self, filename: str, 
+                                     width: int = 320, height: int = 240) -> bytes:
+        """Create a placeholder thumbnail when image cannot be decoded"""
+        img = np.zeros((height, width, 3), dtype=np.uint8)
+        img.fill(200)  # Light gray background
+        
+        # Ensure filename is string
+        filename = str(filename)
+        
+        # Add text
+        text = filename[:15] + "..." if len(filename) > 15 else filename
+        cv2.putText(img, text, (10, height//2 - 20), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (50, 50, 50), 1)
+        cv2.putText(img, "Thumbnail", (10, height//2 + 10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (50, 50, 50), 1)
+        cv2.putText(img, "Unavailable", (10, height//2 + 40), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (50, 50, 50), 1)
+        
+        _, buffer = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        return buffer.tobytes()
 
     def cleanup(self):
         """Clean up resources"""

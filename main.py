@@ -20,7 +20,26 @@ limiter = Limiter(
     default_limits=[settings.RATE_LIMIT_DEFAULT] if settings.RATE_LIMIT_DEFAULT else ["100/minute"]
 )
 
-app = FastAPI(title="API Basic Boilerplate", version="0.0.1")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from App.repository.DLSR_Helper import CameraLiveViewStreamer
+    
+    logger.info("App starting...")
+    
+    # Initialize shared camera streamer
+    app.state.camera_streamer = CameraLiveViewStreamer()
+    logger.info("Shared CameraLiveViewStreamer initialized")
+    
+    yield
+    
+    # Clean up camera streamer on shutdown
+    if hasattr(app.state, "camera_streamer") and app.state.camera_streamer:
+        app.state.camera_streamer.cleanup()
+        logger.info("Shared CameraLiveViewStreamer cleaned up")
+    
+    logger.info("App shutting down...")
+
+app = FastAPI(title="API Basic Boilerplate", version="0.0.1", lifespan=lifespan)
 
 # State and Exception Handlers
 app.state.limiter = limiter
@@ -84,12 +103,6 @@ app.add_middleware(
 # 2. Rate Limiter Middleware (Inner)
 app.add_middleware(SlowAPIMiddleware)
 
-@asynccontextmanager
-async def lifespan():
-    
-    logger.info("App started")
-    yield
-    logger.info("app end")
 
 @app.get("/health", status_code=status.HTTP_200_OK, tags=["System"])
 async def health_check():

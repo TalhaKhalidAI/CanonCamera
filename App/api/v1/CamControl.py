@@ -4,44 +4,20 @@ from typing import Optional
 import time
 from contextlib import asynccontextmanager
 from App.api.dependencies.auth import get_current_active_user
-from App.repository.DLSR_Helper import CameraLiveViewStreamer
+from App.api.dependencies.camera import get_camera_streamer, CameraLiveViewStreamer
 from App.core.LoggingInit import get_core_logger
-from App.schemas.AuthScheema import TokenResponse
-import asyncio
+from typing import List, Dict
 
 # Initialize logger
 logger = get_core_logger(__name__)
 
-# Global camera streamer instance
-clsr: Optional[CameraLiveViewStreamer] = None
-
-@asynccontextmanager
-async def router_lifespan(app=APIRouter):
-    """Lifespan manager for camera streamer"""
-    global clsr
-    try:
-        # Initialize camera streamer but don't start streaming yet
-        clsr = CameraLiveViewStreamer()
-        logger.info("Camera streamer initialized (not started)")
-        
-        yield
-        
-    except Exception as e:
-        logger.error(f"Error in camera router lifespan: {e}")
-    finally:
-        # Clean up on shutdown
-        if clsr:
-            clsr.cleanup()
-            logger.info("Camera streamer cleaned up")
-
 cam_route = APIRouter(
     prefix="/dslr",
-    tags=["DSLR"],
-    lifespan=router_lifespan
+    tags=["DSLR"]
 )
 
 @cam_route.get("/detect")
-async def detect_cameras():
+async def detect_cameras(clsr: CameraLiveViewStreamer = Depends(get_camera_streamer)):
     """
     Detect all available USB cameras.
     """
@@ -74,7 +50,7 @@ async def detect_cameras():
         )
 
 @cam_route.post("/connect")
-async def connect_camera(port: Optional[str] = None):
+async def connect_camera(port: Optional[str] = None, clsr: CameraLiveViewStreamer = Depends(get_camera_streamer)):
     """
     Connect to a specific camera by port or auto-select.
     """
@@ -129,7 +105,7 @@ async def connect_camera(port: Optional[str] = None):
         )
 
 @cam_route.get("/livestream")
-async def live_stream(port: Optional[str] = None):
+async def live_stream(port: Optional[str] = None, clsr: CameraLiveViewStreamer = Depends(get_camera_streamer)):
     """
     MJPEG live stream endpoint.
     Optionally specify port to connect to specific camera.
@@ -172,7 +148,7 @@ async def live_stream(port: Optional[str] = None):
         )
 
 @cam_route.post("/start")
-async def start_stream(port: Optional[str] = None):
+async def start_stream(port: Optional[str] = None, clsr: CameraLiveViewStreamer = Depends(get_camera_streamer)):
     """
     Start the camera live stream manually.
     Optionally specify port to connect to specific camera.
@@ -217,7 +193,7 @@ async def start_stream(port: Optional[str] = None):
         )
 
 @cam_route.post("/stop")
-async def stop_stream():
+async def stop_stream(clsr: CameraLiveViewStreamer = Depends(get_camera_streamer)):
     """
     Stop the camera live stream.
     """
@@ -242,7 +218,7 @@ async def stop_stream():
         )
 
 @cam_route.get("/status")
-async def stream_status():
+async def stream_status(clsr: CameraLiveViewStreamer = Depends(get_camera_streamer)):
     """
     Get current streaming status.
     """
@@ -267,7 +243,7 @@ async def stream_status():
             detail=f"Failed to get stream status: {str(e)}"
         )
 @cam_route.post("/capture")
-async def capture_photo(format: str = "jpg"):
+async def capture_photo(format: str = "jpg", clsr: CameraLiveViewStreamer = Depends(get_camera_streamer)):
     """
     Capture a high-resolution photo.
     Optional parameter: format (jpg/preview)
@@ -544,7 +520,7 @@ async def test_endpoint():
         ]
     }
 @cam_route.get("/health")
-async def camera_health():
+async def camera_health(clsr: CameraLiveViewStreamer = Depends(get_camera_streamer)):
     """Check if camera is properly connected and working"""
     try:
         if not clsr or not clsr.camera:
