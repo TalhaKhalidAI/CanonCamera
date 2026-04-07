@@ -129,7 +129,9 @@ class CameraLiveViewStreamer:
         """Kill GNOME gvfs-gphoto2 processes that steal the USB device."""
         for proc in ["gvfs-gphoto2-volume-monitor", "gvfsd-gphoto2"]:
             try:
-                subprocess.run(["pkill", "-f", proc], capture_output=True, text=True, timeout=2)
+                subprocess.run(
+                    ["pkill", "-f", proc], capture_output=True, text=True, timeout=2
+                )
             except Exception:
                 pass
         time.sleep(0.5)
@@ -294,35 +296,40 @@ class CameraLiveViewStreamer:
                 # 2. HARDWARE RESET: Disable viewfinder to release mirror/data-bus
                 # Using integer for Toggle widget (0=Off)
                 self._set_config_sync("viewfinder", 0)
-                
+
                 # 3. SETTLE: Wait for the camera to finish its own internal work (0.5s)
                 self.camera.wait_for_event(500, self.context)
-                
+
                 # 4. CAPTURE: Execute the shutter command
                 logger.info("Firing shutter with current hardware settings...")
                 capture_info = self.camera.capture(gp.GP_CAPTURE_IMAGE, self.context)
                 logger.info(f"Captured: {capture_info.folder}/{capture_info.name}")
-                
+
                 # 5. RETRIEVE: Get the file data
                 cf = gp.CameraFile()
                 self.camera.file_get(
-                    capture_info.folder, capture_info.name,
-                    gp.GP_FILE_TYPE_NORMAL, cf, self.context,
+                    capture_info.folder,
+                    capture_info.name,
+                    gp.GP_FILE_TYPE_NORMAL,
+                    cf,
+                    self.context,
                 )
                 file_data = bytes(cf.get_data_and_size())
-                
+
                 # 6. CLEANUP: Delete from RAM
                 try:
-                    self.camera.file_delete(capture_info.folder, capture_info.name, self.context)
+                    self.camera.file_delete(
+                        capture_info.folder, capture_info.name, self.context
+                    )
                 except Exception:
                     pass
-                    
+
             self._on_hardware_success()
-            
+
             # Identify resulting image format
             if file_data[:2] == b"\xff\xd8":
                 return file_data, "photo.jpg"
-            
+
             try:
                 arr = np.frombuffer(file_data, dtype=np.uint8)
                 img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -331,7 +338,7 @@ class CameraLiveViewStreamer:
                     return jpg.tobytes(), "photo.jpg"
             except Exception:
                 pass
-                
+
             ext = capture_info.name.rsplit(".", 1)[-1].lower()
             return file_data, f"photo.{ext}"
 
@@ -349,17 +356,19 @@ class CameraLiveViewStreamer:
         try:
             config = self.camera.get_config(self.context)
             child = config.get_child_by_name(name)
-            
+
             # Detect widget type and cast value appropriately
             w_type = child.get_type()
             target_value = value
-            
+
             # Prepare target_value with correct type
             if w_type in (gp.GP_WIDGET_TOGGLE, gp.GP_WIDGET_DATE):
                 try:
                     target_value = int(value)
                 except (ValueError, TypeError):
-                    logger.error(f"Cannot cast '{value}' to int for TOGGLE widget '{name}'")
+                    logger.error(
+                        f"Cannot cast '{value}' to int for TOGGLE widget '{name}'"
+                    )
                     return False
             elif w_type in (gp.GP_WIDGET_MENU, gp.GP_WIDGET_RADIO, gp.GP_WIDGET_TEXT):
                 target_value = str(value)
@@ -367,7 +376,9 @@ class CameraLiveViewStreamer:
                 try:
                     target_value = float(value)
                 except (ValueError, TypeError):
-                    logger.error(f"Cannot cast '{value}' to float for RANGE widget '{name}'")
+                    logger.error(
+                        f"Cannot cast '{value}' to float for RANGE widget '{name}'"
+                    )
                     return False
 
             # 1. Redundancy Check: Skip if already set
@@ -376,11 +387,15 @@ class CameraLiveViewStreamer:
                 # Use string comparison for Menus/Radios to be safe
                 if w_type in (gp.GP_WIDGET_MENU, gp.GP_WIDGET_RADIO):
                     if str(current_value) == str(target_value):
-                        logger.debug(f"Setting {name} already at {target_value}, skipping.")
+                        logger.debug(
+                            f"Setting {name} already at {target_value}, skipping."
+                        )
                         return True
                 else:
                     if current_value == target_value:
-                        logger.debug(f"Setting {name} already at {target_value}, skipping.")
+                        logger.debug(
+                            f"Setting {name} already at {target_value}, skipping."
+                        )
                         return True
             except Exception:
                 pass
@@ -390,9 +405,11 @@ class CameraLiveViewStreamer:
                 choices = []
                 for i in range(child.count_choices()):
                     choices.append(str(child.get_choice(i)))
-                
+
                 if str(target_value) not in choices:
-                    logger.error(f"Invalid choice for {name}: '{target_value}'. Valid: {choices}")
+                    logger.error(
+                        f"Invalid choice for {name}: '{target_value}'. Valid: {choices}"
+                    )
                     return False
 
             # Apply value
@@ -416,16 +433,24 @@ class CameraLiveViewStreamer:
             try:
                 if not (self.camera and self.is_initialized):
                     if retry < max_retry:
-                        logger.info(f"Reconnect attempt {retry + 1}/{max_retry} (Port: {self.selected_port})")
+                        logger.info(
+                            f"Reconnect attempt {retry + 1}/{max_retry} (Port: {self.selected_port})"
+                        )
                         # Try the previous port first
-                        fut = self._gphoto_executor.submit(self._initialise_with_liveview_sync, self.selected_port)
+                        fut = self._gphoto_executor.submit(
+                            self._initialise_with_liveview_sync, self.selected_port
+                        )
                         success = fut.result(timeout=10)
 
                         if not success:
                             # Reconnect Fallback: if the old port is gone (USB address changed),
                             # trigger a full autodetect scan (port=None).
-                            logger.info("Port-specific reconnect failed. Scanning all USB ports...")
-                            fut = self._gphoto_executor.submit(self._initialise_with_liveview_sync, None)
+                            logger.info(
+                                "Port-specific reconnect failed. Scanning all USB ports..."
+                            )
+                            fut = self._gphoto_executor.submit(
+                                self._initialise_with_liveview_sync, None
+                            )
                             success = fut.result(timeout=10)
 
                         retry = 0 if success else retry + 1
@@ -546,7 +571,7 @@ class CameraLiveViewStreamer:
         """Capture high-resolution photo with stream-pause logic."""
         async with self._async_lock:
             was_streaming = self.is_streaming
-            
+
             # Step 1: Pause preview stream if active (required for mirror flip)
             if was_streaming:
                 logger.info("Pausing live-view for high-res capture...")
@@ -722,14 +747,14 @@ class CameraLiveViewStreamer:
 
         applied = {}
         failed = {}
-        
+
         # Hardware Priority Check: If streaming, we must pause for reliability
         was_streaming = self._streaming_event.is_set()
         if was_streaming:
             logger.info("Pausing stream for hardware settings update...")
             self._streaming_event.clear()
             self._disable_liveview_sync()
-            time.sleep(0.3) # Settle mirror/bus
+            time.sleep(0.3)  # Settle mirror/bus
 
         try:
             for key, value in settings.items():
@@ -738,7 +763,7 @@ class CameraLiveViewStreamer:
                     applied[key] = value
                 else:
                     failed[key] = f"Invalid value or hardware rejected {key}"
-            
+
             return {"applied": applied, "failed": failed}
         finally:
             # Resume stream if it was previously active
@@ -801,11 +826,15 @@ class CameraLiveViewStreamer:
                     for fn in self.camera.folder_list_folders(folder, self.context):
                         contents.append(
                             {
-                                "name": str(fn[0]) if isinstance(fn, (tuple, list)) else str(fn),
+                                "name": str(fn[0])
+                                if isinstance(fn, (tuple, list))
+                                else str(fn),
                                 "type": "folder",
                                 "size": 0,
                                 "size_formatted": "—",
-                                "path": f"{folder}/{(str(fn[0]) if isinstance(fn, (tuple, list)) else str(fn))}".replace("//", "/"),
+                                "path": f"{folder}/{(str(fn[0]) if isinstance(fn, (tuple, list)) else str(fn))}".replace(
+                                    "//", "/"
+                                ),
                                 "folder": folder,
                                 "extension": "",
                                 "is_file": False,
