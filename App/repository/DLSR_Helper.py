@@ -782,73 +782,129 @@ class CameraLiveViewStreamer:
             return await self._run(self._list_sd_card_sync, folder)
 
     def _list_sd_card_sync(self, folder: str = "/") -> List[Dict]:
-        """List SD card using file_get_info() — zero bytes downloaded."""
+        """List SD card files/folders with automated path fallback for Canon/Nikon."""
         self._check_circuit_breaker()
+
+        # 1. Path Sanitization
+        if folder != "/" and folder.endswith("/"):
+            folder = folder.rstrip("/")
+        if not folder.startswith("/"):
+            folder = "/" + folder
+
+        # 2. Hardware Priority Check
+        was_streaming = self._streaming_event.is_set()
+        if was_streaming:
+            logger.info(f"Pausing stream for SD card access at: {folder}")
+            self._streaming_event.clear()
+            self._disable_liveview_sync()
+            
+            # Wait for camera to finish its last preview frame cycle
+            try:
+                self.camera.wait_for_event(300, self.context)
+            except Exception:
+                pass
+            time.sleep(0.8)  # Settle mirror/bus
+
         try:
             with self.lock:
                 if not (self.camera and self.is_initialized):
                     raise RuntimeError("Camera not initialised.")
-                contents: List[Dict] = []
-                try:
-                    for fi in self.camera.folder_list_files(folder, self.context):
-                        name = str(fi[0]) if isinstance(fi, (tuple, list)) else str(fi)
-                        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-                        size = 0
-                        try:
-                            info = self.camera.file_get_info(folder, name, self.context)
-                            size = info.file.size
-                        except Exception as e:
-                            logger.debug(f"file_get_info failed for {name}: {e}")
-                        ftype = (
-                            "image"
-                            if ext in {"jpg", "jpeg", "png", "bmp", "tiff", "tif"}
-                            else "raw"
-                            if ext in {"cr2", "cr3", "nef", "arw", "dng"}
-                            else "video"
-                            if ext in {"mp4", "avi", "mov", "mkv"}
-                            else "file"
+
+                # Try listing with the provided path
+                contents = self._do_list_folder_sync(folder)
+
+                # 3. Path Fallback Logic
+                if not contents and folder.startswith("/store_"):
+                    parts = folder.split("/", 2)
+                    if len(parts) > 2:
+                        fallback_path = "/" + parts[2]
+                        logger.info(
+                            f"Folder {folder} appeared empty. Trying fallback path: {fallback_path}"
                         )
-                        contents.append(
-                            {
-                                "name": name,
-                                "type": ftype,
-                                "size": size,
-                                "size_formatted": self._format_size_sync(size),
-                                "path": f"{folder}/{name}",
-                                "folder": folder,
-                                "extension": ext,
-                                "is_file": True,
-                            }
-                        )
-                except Exception as e:
-                    logger.warning(f"Could not list files in {folder}: {e}")
-                try:
-                    for fn in self.camera.folder_list_folders(folder, self.context):
-                        contents.append(
-                            {
-                                "name": str(fn[0])
-                                if isinstance(fn, (tuple, list))
-                                else str(fn),
-                                "type": "folder",
-                                "size": 0,
-                                "size_formatted": "—",
-                                "path": f"{folder}/{(str(fn[0]) if isinstance(fn, (tuple, list)) else str(fn))}".replace(
-                                    "//", "/"
-                                ),
-                                "folder": folder,
-                                "extension": "",
-                                "is_file": False,
-                            }
-                        )
-                except Exception as e:
-                    logger.warning(f"Could not list folders in {folder}: {e}")
-            self._on_hardware_success()
+                        contents = self._do_list_folder_sync(fallback_path)
+
+                self._on_hardware_success()
+                return contents
+
+        finally:
+            if was_streaming:
+                logger.debug("Resuming stream after SD access...")
+                self._initialise_with_liveview_sync(self.selected_port)
+                self._streaming_event.set()
+                self._gphoto_executor.submit(self._stream_frames)
+
+    def _do_list_folder_sync(self, folder: str) -> List[Dict]:
+        """Internal helper using robust index-based GPhoto list calls."""
+        contents: List[Dict] = []
+        try:
+            # List Files using explicit index (iron-clad for Canon)
+            try:
+                raw_files = self.camera.folder_list_files(folder, self.context)
+                num_files = raw_files.count()
+                logger.info(f"GPhoto detected {num_files} files in {folder}")
+                
+                for i in range(num_files):
+                    name = raw_files.get_name(i)
+                    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+                    size = 0
+                    try:
+                        info = self.camera.file_get_info(folder, name, self.context)
+                        size = info.file.size
+                    except Exception:
+                        pass
+
+                    ftype = (
+                        "image"
+                        if ext in {"jpg", "jpeg", "png", "bmp", "tiff", "tif"}
+                        else "raw"
+                        if ext in {"cr2", "cr3", "nef", "arw", "dng"}
+                        else "video"
+                        if ext in {"mp4", "avi", "mov", "mkv"}
+                        else "file"
+                    )
+                    contents.append(
+                        {
+                            "name": name,
+                            "type": ftype,
+                            "size": size,
+                            "size_formatted": self._format_size(size),
+                            "path": f"{folder}/{name}".replace("//", "/"),
+                            "folder": folder,
+                            "extension": ext,
+                            "is_file": True,
+                        }
+                    )
+            except Exception as e:
+                logger.debug(f"File listing failed for {folder}: {e}")
+
+            # List Folders using explicit index
+            try:
+                raw_folders = self.camera.folder_list_folders(folder, self.context)
+                num_folders = raw_folders.count()
+                logger.info(f"GPhoto detected {num_folders} subfolders in {folder}")
+                
+                for i in range(num_folders):
+                    name = raw_folders.get_name(i)
+                    contents.append(
+                        {
+                            "name": name,
+                            "type": "folder",
+                            "size": 0,
+                            "size_formatted": "—",
+                            "path": f"{folder}/{name}".replace("//", "/"),
+                            "folder": folder,
+                            "extension": "",
+                            "is_file": False,
+                        }
+                    )
+            except Exception as e:
+                logger.debug(f"Folder listing failed for {folder}: {e}")
+
             contents.sort(key=lambda x: (x["is_file"], x["name"].lower()))
-            logger.info(f"Listed {len(contents)} items from {folder}")
             return contents
         except Exception as e:
-            self._on_hardware_error(e)
-            raise
+            logger.warning(f"Failed to list {folder}: {e}")
+            return []
 
     async def search_images(
         self,
