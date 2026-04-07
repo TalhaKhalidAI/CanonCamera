@@ -343,7 +343,7 @@ class CameraLiveViewStreamer:
             raise
 
     def _set_config_sync(self, name: str, value: Any) -> bool:
-        """Set a camera configuration parameter with smart type-casting."""
+        """Set a camera configuration parameter with smart type-casting and validation."""
         if not (self.camera and self.is_initialized):
             return False
         try:
@@ -352,17 +352,53 @@ class CameraLiveViewStreamer:
             
             # Detect widget type and cast value appropriately
             w_type = child.get_type()
+            target_value = value
+            
+            # Prepare target_value with correct type
             if w_type in (gp.GP_WIDGET_TOGGLE, gp.GP_WIDGET_DATE):
-                child.set_value(int(value))
+                try:
+                    target_value = int(value)
+                except (ValueError, TypeError):
+                    logger.error(f"Cannot cast '{value}' to int for TOGGLE widget '{name}'")
+                    return False
             elif w_type in (gp.GP_WIDGET_MENU, gp.GP_WIDGET_RADIO, gp.GP_WIDGET_TEXT):
-                child.set_value(str(value))
+                target_value = str(value)
             elif w_type == gp.GP_WIDGET_RANGE:
-                child.set_value(float(value))
-            else:
-                child.set_value(value)
+                try:
+                    target_value = float(value)
+                except (ValueError, TypeError):
+                    logger.error(f"Cannot cast '{value}' to float for RANGE widget '{name}'")
+                    return False
 
+            # 1. Redundancy Check: Skip if already set
+            try:
+                current_value = child.get_value()
+                # Use string comparison for Menus/Radios to be safe
+                if w_type in (gp.GP_WIDGET_MENU, gp.GP_WIDGET_RADIO):
+                    if str(current_value) == str(target_value):
+                        logger.debug(f"Setting {name} already at {target_value}, skipping.")
+                        return True
+                else:
+                    if current_value == target_value:
+                        logger.debug(f"Setting {name} already at {target_value}, skipping.")
+                        return True
+            except Exception:
+                pass
+
+            # 2. Choice Validation: Verify value is supported
+            if w_type in (gp.GP_WIDGET_MENU, gp.GP_WIDGET_RADIO):
+                choices = []
+                for i in range(child.count_choices()):
+                    choices.append(str(child.get_choice(i)))
+                
+                if str(target_value) not in choices:
+                    logger.error(f"Invalid choice for {name}: '{target_value}'. Valid: {choices}")
+                    return False
+
+            # Apply value
+            child.set_value(target_value)
             self.camera.set_config(config, self.context)
-            logger.debug(f"Config set: {name}={value} (Type: {w_type})")
+            logger.info(f"Hardware setting updated: {name}={target_value}")
             return True
         except Exception as e:
             logger.error(f"Config set error ({name}={value}): {e}")
@@ -616,15 +652,22 @@ class CameraLiveViewStreamer:
     # Keys we actively expose in the settings API (EOS standard names)
     SETTINGS_KEYS = [
         "iso",
+        "isospeed",
         "shutterspeed",
+        "shutter_speed",
         "aperture",
+        "f-number",
         "whitebalance",
+        "white_balance",
         "exposurecompensation",
         "imageformat",
+        "imageformatcf",
+        "imagequality",
         "capturetarget",
         "colorspace",
         "picturestyle",
         "autoexposuremode",
+        "expprogram",
         "drivemode",
     ]
 
@@ -673,21 +716,37 @@ class CameraLiveViewStreamer:
             return await self._run(self._set_camera_settings_sync, settings)
 
     def _set_camera_settings_sync(self, settings: Dict) -> Dict:
+        """Batch update settings with stream-pause logic to avoid USB contention."""
         if not (self.camera and self.is_initialized):
             raise RuntimeError("Camera not initialised.")
 
         applied = {}
         failed = {}
-        for key, value in settings.items():
-            ok = self._set_config_sync(key, value)
-            if ok:
-                applied[key] = value
-                logger.info(f"Setting applied: {key}={value}")
-            else:
-                failed[key] = f"Failed to set {key}={value}"
-                logger.warning(f"Setting failed: {key}={value}")
+        
+        # Hardware Priority Check: If streaming, we must pause for reliability
+        was_streaming = self._streaming_event.is_set()
+        if was_streaming:
+            logger.info("Pausing stream for hardware settings update...")
+            self._streaming_event.clear()
+            self._disable_liveview_sync()
+            time.sleep(0.3) # Settle mirror/bus
 
-        return {"applied": applied, "failed": failed}
+        try:
+            for key, value in settings.items():
+                ok = self._set_config_sync(key, value)
+                if ok:
+                    applied[key] = value
+                else:
+                    failed[key] = f"Invalid value or hardware rejected {key}"
+            
+            return {"applied": applied, "failed": failed}
+        finally:
+            # Resume stream if it was previously active
+            if was_streaming:
+                logger.info("Resuming stream after settings update...")
+                self._initialise_with_liveview_sync(self.selected_port)
+                self._streaming_event.set()
+                self._gphoto_executor.submit(self._stream_frames)
 
     # ------------------------------------------------------------------
     # Public async API — SD Card
