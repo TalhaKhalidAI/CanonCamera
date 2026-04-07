@@ -1,6 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Body
 from fastapi.responses import StreamingResponse, Response, HTMLResponse
-from typing import Optional
+from typing import Optional, Dict
 import time
 
 from App.api.dependencies.auth import get_current_active_user
@@ -19,7 +19,6 @@ cam_route = APIRouter(prefix="/dslr", tags=["DSLR"])
 @cam_route.get("/detect")
 async def detect_cameras(
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-   # _user=Depends(get_current_active_user),
 ):
     """Detect all available USB cameras."""
     cameras = await clsr.detect_usb_cameras()
@@ -35,7 +34,6 @@ async def detect_cameras(
 async def connect_camera(
     port: Optional[str] = None,
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-   # _user=Depends(get_current_active_user),
 ):
     """Connect to a specific camera by port or auto-select."""
     if not port:
@@ -48,15 +46,45 @@ async def connect_camera(
     success = await clsr.connect_to_camera(port)
     if not success:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to connect to camera at {port}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to connect to camera"
         )
-    return {
-        "status": "connected",
-        "message": f"Connected to camera at {port}",
-        "port": port,
-        "camera_model": clsr.camera_model,
-    }
+    return {"status": "connected", "port": port}
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+@cam_route.get("/settings")
+async def get_settings(
+    clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
+):
+    """Fetch current camera settings and allowed values."""
+    try:
+        settings = await clsr.get_camera_settings()
+        return {"status": "success", "settings": settings}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@cam_route.patch("/settings")
+async def update_settings(
+    settings: Dict[str, str] = Body(...),
+    clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
+):
+    """Update one or more camera settings."""
+    try:
+        result = await clsr.set_camera_settings(settings)
+        return {"status": "success", **result}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
 
 
 # ---------------------------------------------------------------------------

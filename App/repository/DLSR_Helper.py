@@ -610,6 +610,86 @@ class CameraLiveViewStreamer:
         logger.info("Camera streamer cleanup complete")
 
     # ------------------------------------------------------------------
+    # Public async API — Camera Settings
+    # ------------------------------------------------------------------
+
+    # Keys we actively expose in the settings API (EOS standard names)
+    SETTINGS_KEYS = [
+        "iso",
+        "shutterspeed",
+        "aperture",
+        "whitebalance",
+        "exposurecompensation",
+        "imageformat",
+        "capturetarget",
+        "colorspace",
+        "picturestyle",
+        "autoexposuremode",
+        "drivemode",
+    ]
+
+    async def get_camera_settings(self) -> Dict:
+        """Read current hardware settings directly from the camera."""
+        async with self._async_lock:
+            return await self._run(self._get_camera_settings_sync)
+
+    def _get_camera_settings_sync(self) -> Dict:
+        if not (self.camera and self.is_initialized):
+            raise RuntimeError("Camera not initialised.")
+        try:
+            config = self.camera.get_config(self.context)
+        except Exception as e:
+            raise RuntimeError(f"Failed to fetch config from camera: {e}")
+
+        result = {}
+        for key in self.SETTINGS_KEYS:
+            try:
+                widget = config.get_child_by_name(key)
+                w_type = widget.get_type()
+                value = widget.get_value()
+
+                # Build allowed choices for Menu/Radio widgets
+                choices = []
+                if w_type in (gp.GP_WIDGET_MENU, gp.GP_WIDGET_RADIO):
+                    for i in range(widget.count_choices()):
+                        choices.append(widget.get_choice(i))
+
+                result[key] = {
+                    "value": value,
+                    "label": widget.get_label(),
+                    "type": w_type,
+                    "choices": choices,
+                    "readonly": bool(widget.get_readonly()),
+                }
+            except Exception:
+                pass  # Skip settings not supported by this camera model
+
+        logger.info(f"Fetched {len(result)} settings from camera hardware")
+        return result
+
+    async def set_camera_settings(self, settings: Dict) -> Dict:
+        """Write one or more settings back to the camera hardware."""
+        async with self._async_lock:
+            return await self._run(self._set_camera_settings_sync, settings)
+
+    def _set_camera_settings_sync(self, settings: Dict) -> Dict:
+        if not (self.camera and self.is_initialized):
+            raise RuntimeError("Camera not initialised.")
+
+        applied = {}
+        failed = {}
+        for key, value in settings.items():
+            ok = self._set_config_sync(key, value)
+            if ok:
+                applied[key] = value
+                logger.info(f"Setting applied: {key}={value}")
+            else:
+                failed[key] = f"Failed to set {key}={value}"
+                logger.warning(f"Setting failed: {key}={value}")
+
+        return {"applied": applied, "failed": failed}
+
+    # ------------------------------------------------------------------
     # Public async API — SD Card
     # ------------------------------------------------------------------
 
