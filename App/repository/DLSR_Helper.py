@@ -347,11 +347,19 @@ class CameraLiveViewStreamer:
             try:
                 if not (self.camera and self.is_initialized):
                     if retry < max_retry:
-                        logger.info(f"Reconnect attempt {retry + 1}/{max_retry}")
-                        fut = self._gphoto_executor.submit(
-                            self._initialise_with_liveview_sync, self.selected_port
-                        )
-                        retry = 0 if fut.result(timeout=10) else retry + 1
+                        logger.info(f"Reconnect attempt {retry + 1}/{max_retry} (Port: {self.selected_port})")
+                        # Try the previous port first
+                        fut = self._gphoto_executor.submit(self._initialise_with_liveview_sync, self.selected_port)
+                        success = fut.result(timeout=10)
+
+                        if not success:
+                            # Reconnect Fallback: if the old port is gone (USB address changed),
+                            # trigger a full autodetect scan (port=None).
+                            logger.info("Port-specific reconnect failed. Scanning all USB ports...")
+                            fut = self._gphoto_executor.submit(self._initialise_with_liveview_sync, None)
+                            success = fut.result(timeout=10)
+
+                        retry = 0 if success else retry + 1
                         time.sleep(1)
                     else:
                         logger.error("Max reconnection attempts — stopping stream")
