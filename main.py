@@ -34,7 +34,7 @@ async def lifespan(app: FastAPI):
     
     # Clean up camera streamer on shutdown
     if hasattr(app.state, "camera_streamer") and app.state.camera_streamer:
-        app.state.camera_streamer.cleanup()
+        await app.state.camera_streamer.cleanup()
         logger.info("Shared CameraLiveViewStreamer cleaned up")
     
     logger.info("App shutting down...")
