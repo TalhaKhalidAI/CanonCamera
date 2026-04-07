@@ -17,33 +17,38 @@ logger = get_core_logger(__name__)
 # Initialize Limiter
 limiter = Limiter(
     key_func=get_remote_address,
-    default_limits=[settings.RATE_LIMIT_DEFAULT] if settings.RATE_LIMIT_DEFAULT else ["100/minute"]
+    default_limits=[settings.RATE_LIMIT_DEFAULT]
+    if settings.RATE_LIMIT_DEFAULT
+    else ["100/minute"],
 )
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from App.repository.DLSR_Helper import CameraLiveViewStreamer
-    
+
     logger.info("App starting...")
-    
+
     # Initialize shared camera streamer
     app.state.camera_streamer = CameraLiveViewStreamer()
     logger.info("Shared CameraLiveViewStreamer initialized")
-    
+
     yield
-    
+
     # Clean up camera streamer on shutdown
     if hasattr(app.state, "camera_streamer") and app.state.camera_streamer:
         await app.state.camera_streamer.cleanup()
         logger.info("Shared CameraLiveViewStreamer cleaned up")
-    
+
     logger.info("App shutting down...")
 
-app = FastAPI(title="API Basic Boilerplate", version="0.0.1", lifespan=lifespan)
+
+app = FastAPI(title="Photo Booth", version="0.0.1", lifespan=lifespan)
 
 # State and Exception Handlers
 app.state.limiter = limiter
 app.state.auto_kill_enabled = False  # Global flag for automatic protection
+
 
 @app.exception_handler(RateLimitExceeded)
 async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded):
@@ -51,8 +56,9 @@ async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded):
     detail = getattr(exc, "detail", str(exc))
     return JSONResponse(
         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-        content={"error": f"Rate limit exceeded: {detail}"}
+        content={"error": f"Rate limit exceeded: {detail}"},
     )
+
 
 @app.middleware("http")
 async def kill_switch_middleware(request: Request, call_next):
@@ -60,35 +66,40 @@ async def kill_switch_middleware(request: Request, call_next):
     # Whitelist System and Documentation endpoints
     path = request.url.path
     is_whitelisted = (
-        path == "/health" or 
-        path.startswith("/docs") or 
-        path.startswith("/redoc") or 
-        path.startswith("/openapi.json") or
-        path.endswith("/reset-auto-kill")
+        path == "/health"
+        or path.startswith("/docs")
+        or path.startswith("/redoc")
+        or path.startswith("/openapi.json")
+        or path.endswith("/reset-auto-kill")
     )
-    
+
     # Check both manual and automatic kill switches
     is_killed = settings.KILL_SWITCH_ENABLED or app.state.auto_kill_enabled
-    
+
     if is_killed and not is_whitelisted:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={
                 "detail": "Service is temporarily unavailable due to maintenance.",
-                "type": "auto_kill" if app.state.auto_kill_enabled else "manual_kill"
-            }
+                "type": "auto_kill" if app.state.auto_kill_enabled else "manual_kill",
+            },
         )
-    
+
     try:
         response = await call_next(request)
         return response
     except Exception as e:
-        logger.error(f"CRITICAL: Unhandled exception detected. Triggering AUTO-KILL. Error: {e}")
+        logger.error(
+            f"CRITICAL: Unhandled exception detected. Triggering AUTO-KILL. Error: {e}"
+        )
         app.state.auto_kill_enabled = True
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"detail": "An internal error occurred. System has entered safety mode."}
+            content={
+                "detail": "An internal error occurred. System has entered safety mode."
+            },
         )
+
 
 # Add Middlewares (Order: Outermost -> Innermost)
 # 1. CORS (Outermost)
@@ -109,5 +120,6 @@ app.add_middleware(SlowAPIMiddleware)
 async def health_check():
     """Simple health check endpoint for monitoring"""
     return {"status": "healthy", "version": "0.0.1"}
+
 
 app.include_router(app_router, prefix="/app/v1")
