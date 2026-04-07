@@ -21,7 +21,7 @@ camsd_route = APIRouter(prefix="/sd", tags=["DSLR_Storage"])
 async def list_sd_card(
     folder: str = "/",
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    _user=Depends(get_current_active_user),
+   # _user=Depends(get_current_active_user),
 ):
     """List contents of the camera's SD card."""
     if not clsr.get_status().get("camera_connected"):
@@ -36,7 +36,7 @@ async def list_sd_card(
 @camsd_route.get("/test")
 async def test_sd_card(
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    _user=Depends(get_current_active_user),
+   # _user=Depends(get_current_active_user),
 ):
     """Test SD card access."""
     results: Dict = {
@@ -81,7 +81,7 @@ async def search_images(
     recursive: bool = True,
     extensions: Optional[str] = None,
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    _user=Depends(get_current_active_user),
+   # _user=Depends(get_current_active_user),
 ):
     """Search for images on SD card."""
     ext_list = [e.strip().lower() for e in extensions.split(",")] if extensions else None
@@ -98,7 +98,7 @@ async def search_images(
 async def download_sd_image(
     file_path: str,
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    _user=Depends(get_current_active_user),
+   # _user=Depends(get_current_active_user),
 ):
     """Download an image from SD card by absolute path."""
     file_data, filename, metadata = await clsr.download_image_by_path(file_path)
@@ -130,7 +130,7 @@ async def get_image_thumbnail(
     width: int = 320,
     height: int = 240,
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    _user=Depends(get_current_active_user),
+   # _user=Depends(get_current_active_user),
 ):
     """Get an embedded EXIF thumbnail from the camera."""
     folder = os.path.dirname(file_path) if "/" in file_path else "/"
@@ -147,7 +147,7 @@ async def get_image_thumbnail(
 async def batch_download_images(
     file_list: List[Dict],
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    _user=Depends(get_current_active_user),
+   # _user=Depends(get_current_active_user),
 ):
     """Download multiple images. Returns a ZIP for >1 file."""
     results = await clsr.download_multiple_images(file_list)
@@ -186,7 +186,7 @@ async def batch_download_images(
 async def delete_sd_image(
     file_path: str,
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    _user=Depends(get_current_active_user),
+   # _user=Depends(get_current_active_user),
 ):
     """Delete an image from the camera's SD card."""
     folder = os.path.dirname(file_path) if "/" in file_path else "/"

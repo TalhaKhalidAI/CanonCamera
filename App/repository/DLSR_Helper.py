@@ -27,7 +27,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from queue import Empty, Queue
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import gphoto2 as gp
@@ -126,18 +126,13 @@ class CameraLiveViewStreamer:
         return True
 
     def _kill_gvfs_mounter(self) -> None:
-        """Kill ONLY the GNOME gvfs-gphoto2 automounter that steals the USB
-        device.  We do NOT use os.kill or kill arbitrary processes."""
-        try:
-            subprocess.run(
-                ["pkill", "-f", "gvfs-gphoto2-volume-monitor"],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            time.sleep(0.3)
-        except Exception as e:
-            logger.debug(f"gvfs-gphoto2 kill skipped: {e}")
+        """Kill GNOME gvfs-gphoto2 processes that steal the USB device."""
+        for proc in ["gvfs-gphoto2-volume-monitor", "gvfsd-gphoto2"]:
+            try:
+                subprocess.run(["pkill", "-f", proc], capture_output=True, text=True, timeout=2)
+            except Exception:
+                pass
+        time.sleep(0.5)
 
     def _detect_usb_cameras_sync(self) -> List[Dict]:
         if not self._initialize_context():
@@ -182,14 +177,15 @@ class CameraLiveViewStreamer:
         cam = gp.Camera()
         if port:
             try:
-                for name, addr in gp.Camera.autodetect(self.context):
-                    if addr == port:
-                        cam.set_port_info(addr)
-                        self.selected_port = addr
-                        self.camera_model = name
-                        break
+                # Need to find the GPPortInfo object for this port string
+                port_info_list = gp.PortInfoList()
+                port_info_list.load()
+                idx = port_info_list.lookup_path(port)
+                cam.set_port_info(port_info_list[idx])
+                self.selected_port = port
+                logger.info(f"Fixed port set for: {port}")
             except Exception as e:
-                logger.warning(f"Could not set port {port}: {e}")
+                logger.warning(f"Could not set port {port} via GPPortInfo: {e}")
         try:
             cam.init(self.context)
         except gp.GPhoto2Error as e:
@@ -224,38 +220,21 @@ class CameraLiveViewStreamer:
             if not self._init_camera_sync(port):
                 return False
 
-        # Enable live view (best-effort)
-        try:
-            config = self.camera.get_config(self.context)  # type: ignore[union-attr]
-            for name in ("viewfinder", "eosviewfinder", "liveview"):
-                try:
-                    vf = config.get_child_by_name(name)
-                    vf.set_value(1)
-                    self.camera.set_config(config, self.context)  # type: ignore[union-attr]
-                    logger.info(f"Live view enabled via '{name}'")
-                    break
-                except Exception:
-                    continue
-        except Exception as e:
-            logger.warning(f"Could not configure live view: {e}")
+        # Enable live view (best-effort using smart config)
+        for name in ("viewfinder", "eosviewfinder", "liveview"):
+            if self._set_config_sync(name, 1):
+                logger.info(f"Live view enabled via '{name}'")
+                break
         return True
 
     def _disable_liveview_sync(self) -> None:
+        """Disable live-view hardware to release sensor/mirror resources."""
         if not (self.camera and self.is_initialized):
             return
-        try:
-            config = self.camera.get_config(self.context)
-            for name in ("viewfinder", "eosviewfinder", "liveview"):
-                try:
-                    vf = config.get_child_by_name(name)
-                    vf.set_value(0)
-                    self.camera.set_config(config, self.context)
-                    logger.info("Live view disabled")
-                    break
-                except Exception:
-                    continue
-        except Exception as e:
-            logger.warning(f"Error disabling live view: {e}")
+        for name in ("viewfinder", "eosviewfinder", "liveview"):
+            if self._set_config_sync(name, 0):
+                logger.info(f"Hardware live-view released via '{name}'")
+                break
 
     def _cleanup_camera_sync(self) -> None:
         """Release camera resources.  Safe to call multiple times."""
@@ -303,37 +282,91 @@ class CameraLiveViewStreamer:
         try:
             with self.lock:
                 if not (self.camera and self.is_initialized):
-                    raise RuntimeError(
-                        "Camera not initialised. Call start_streaming() first."
-                    )
+                    raise RuntimeError("Camera not initialised.")
+
+                # 1. DEEP SYNC: Re-fetch current hardware config to sync settings (ISO, etc.)
+                try:
+                    _ = self.camera.get_config(self.context)
+                    logger.debug("Hardware settings synced from camera.")
+                except Exception as e:
+                    logger.warning(f"Config fetch failed, continuing with current: {e}")
+
+                # 2. HARDWARE RESET: Disable viewfinder to release mirror/data-bus
+                # Using integer for Toggle widget (0=Off)
+                self._set_config_sync("viewfinder", 0)
+                
+                # 3. SETTLE: Wait for the camera to finish its own internal work (0.5s)
+                self.camera.wait_for_event(500, self.context)
+                
+                # 4. CAPTURE: Execute the shutter command
+                logger.info("Firing shutter with current hardware settings...")
                 capture_info = self.camera.capture(gp.GP_CAPTURE_IMAGE, self.context)
                 logger.info(f"Captured: {capture_info.folder}/{capture_info.name}")
+                
+                # 5. RETRIEVE: Get the file data
                 cf = gp.CameraFile()
                 self.camera.file_get(
-                    capture_info.folder,
-                    capture_info.name,
-                    gp.GP_FILE_TYPE_NORMAL,
-                    cf,
-                    self.context,
+                    capture_info.folder, capture_info.name,
+                    gp.GP_FILE_TYPE_NORMAL, cf, self.context,
                 )
                 file_data = bytes(cf.get_data_and_size())
+                
+                # 6. CLEANUP: Delete from RAM
+                try:
+                    self.camera.file_delete(capture_info.folder, capture_info.name, self.context)
+                except Exception:
+                    pass
+                    
             self._on_hardware_success()
+            
+            # Identify resulting image format
+            if file_data[:2] == b"\xff\xd8":
+                return file_data, "photo.jpg"
+            
+            try:
+                arr = np.frombuffer(file_data, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img is not None:
+                    _, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    return jpg.tobytes(), "photo.jpg"
+            except Exception:
+                pass
+                
+            ext = capture_info.name.rsplit(".", 1)[-1].lower()
+            return file_data, f"photo.{ext}"
+
+        except gp.GPhoto2Error as e:
+            self._on_hardware_error(e)
+            raise
         except Exception as e:
             self._on_hardware_error(e)
             raise
 
-        if file_data[:2] == b"\xff\xd8":
-            return file_data, "photo.jpg"
+    def _set_config_sync(self, name: str, value: Any) -> bool:
+        """Set a camera configuration parameter with smart type-casting."""
+        if not (self.camera and self.is_initialized):
+            return False
         try:
-            arr = np.frombuffer(file_data, dtype=np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if img is not None:
-                _, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                return jpg.tobytes(), "photo.jpg"
+            config = self.camera.get_config(self.context)
+            child = config.get_child_by_name(name)
+            
+            # Detect widget type and cast value appropriately
+            w_type = child.get_type()
+            if w_type in (gp.GP_WIDGET_TOGGLE, gp.GP_WIDGET_DATE):
+                child.set_value(int(value))
+            elif w_type in (gp.GP_WIDGET_MENU, gp.GP_WIDGET_RADIO, gp.GP_WIDGET_TEXT):
+                child.set_value(str(value))
+            elif w_type == gp.GP_WIDGET_RANGE:
+                child.set_value(float(value))
+            else:
+                child.set_value(value)
+
+            self.camera.set_config(config, self.context)
+            logger.debug(f"Config set: {name}={value} (Type: {w_type})")
+            return True
         except Exception as e:
-            logger.error(f"Decode error: {e}")
-        ext = capture_info.name.rsplit(".", 1)[-1].lower()
-        return file_data, f"photo.{ext}"
+            logger.error(f"Config set error ({name}={value}): {e}")
+            return False
 
     # ------------------------------------------------------------------
     # Streaming background thread
@@ -474,8 +507,27 @@ class CameraLiveViewStreamer:
         logger.info("Streaming stopped")
 
     async def capture_photo(self) -> Tuple[bytes, str]:
+        """Capture high-resolution photo with stream-pause logic."""
         async with self._async_lock:
-            return await self._run(self._capture_photo_sync)
+            was_streaming = self.is_streaming
+            
+            # Step 1: Pause preview stream if active (required for mirror flip)
+            if was_streaming:
+                logger.info("Pausing live-view for high-res capture...")
+                self._streaming_event.clear()
+                # Give the mirror and sensor time to reset
+                await asyncio.sleep(1.2)
+
+            try:
+                # Step 2: Execute actual capture
+                res = await self._run(self._capture_photo_sync)
+                return res
+            finally:
+                # Step 3: Always resume stream if it was on
+                if was_streaming:
+                    logger.info("Resuming live-view...")
+                    self._streaming_event.set()
+                    self._gphoto_executor.submit(self._stream_frames)
 
     def get_latest_frame(self, timeout: float = 0.1) -> Optional[bytes]:
         """Return only the most recent frame, discarding stale ones."""
@@ -575,7 +627,7 @@ class CameraLiveViewStreamer:
                 contents: List[Dict] = []
                 try:
                     for fi in self.camera.folder_list_files(folder, self.context):
-                        name = str(fi.name)
+                        name = str(fi[0]) if isinstance(fi, (tuple, list)) else str(fi)
                         ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
                         size = 0
                         try:
@@ -597,7 +649,7 @@ class CameraLiveViewStreamer:
                                 "name": name,
                                 "type": ftype,
                                 "size": size,
-                                "size_formatted": self._format_size(size),
+                                "size_formatted": self._format_size_sync(size),
                                 "path": f"{folder}/{name}",
                                 "folder": folder,
                                 "extension": ext,
@@ -610,11 +662,11 @@ class CameraLiveViewStreamer:
                     for fn in self.camera.folder_list_folders(folder, self.context):
                         contents.append(
                             {
-                                "name": str(fn),
+                                "name": str(fn[0]) if isinstance(fn, (tuple, list)) else str(fn),
                                 "type": "folder",
                                 "size": 0,
                                 "size_formatted": "—",
-                                "path": f"{folder}/{fn}",
+                                "path": f"{folder}/{(str(fn[0]) if isinstance(fn, (tuple, list)) else str(fn))}".replace("//", "/"),
                                 "folder": folder,
                                 "extension": "",
                                 "is_file": False,

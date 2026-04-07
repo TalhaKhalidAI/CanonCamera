@@ -63,7 +63,8 @@ async def kill_switch_middleware(request: Request, call_next):
         path == "/health" or 
         path.startswith("/docs") or 
         path.startswith("/redoc") or 
-        path.startswith("/openapi.json")
+        path.startswith("/openapi.json") or
+        path.endswith("/reset-auto-kill")
     )
     
     # Check both manual and automatic kill switches

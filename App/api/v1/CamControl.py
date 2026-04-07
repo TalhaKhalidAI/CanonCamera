@@ -19,7 +19,7 @@ cam_route = APIRouter(prefix="/dslr", tags=["DSLR"])
 @cam_route.get("/detect")
 async def detect_cameras(
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    _user=Depends(get_current_active_user),
+   # _user=Depends(get_current_active_user),
 ):
     """Detect all available USB cameras."""
     cameras = await clsr.detect_usb_cameras()
@@ -35,7 +35,7 @@ async def detect_cameras(
 async def connect_camera(
     port: Optional[str] = None,
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    _user=Depends(get_current_active_user),
+   # _user=Depends(get_current_active_user),
 ):
     """Connect to a specific camera by port or auto-select."""
     if not port:
@@ -67,7 +67,7 @@ async def connect_camera(
 async def start_stream(
     port: Optional[str] = None,
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    _user=Depends(get_current_active_user),
+   # _user=Depends(get_current_active_user),
 ):
     """Start the camera live stream."""
     if clsr.is_streaming:
@@ -93,7 +93,7 @@ async def start_stream(
 @cam_route.post("/stop")
 async def stop_stream(
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    _user=Depends(get_current_active_user),
+   ## _user=Depends(get_current_active_user),
 ):
     """Stop the camera live stream."""
     await clsr.stop_streaming()
@@ -104,7 +104,7 @@ async def stop_stream(
 async def live_stream(
     port: Optional[str] = None,
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    _user=Depends(get_current_active_user),
+   # _user=Depends(get_current_active_user),
 ):
     """MJPEG live stream endpoint."""
     if not clsr.is_streaming:
@@ -127,7 +127,7 @@ async def live_stream(
 @cam_route.get("/status")
 async def stream_status(
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    _user=Depends(get_current_active_user),
+   # _user=Depends(get_current_active_user),
 ):
     """Get current streaming status."""
     info = clsr.get_status()
@@ -141,40 +141,49 @@ async def stream_status(
 @cam_route.post("/capture")
 async def capture_photo(
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    _user=Depends(get_current_active_user),
 ):
     """Capture a high-resolution photo."""
-    if not clsr.camera:
-        if not await clsr.start_streaming():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Camera not connected. Start stream first.",
-            )
+    try:
+        if not clsr.camera:
+            # Try to connect if not already connected
+            if not await clsr.start_streaming():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Camera not connected. Start stream first.",
+                )
 
-    file_data, filename = await clsr.capture_photo()
+        file_data, filename = await clsr.capture_photo()
 
-    # Detect content type from magic bytes
-    if file_data[:2] == b"\xff\xd8":
-        content_type = "image/jpeg"
-    elif file_data[:4] == b"\x89PNG":
-        content_type = "image/png"
-    elif file_data[:2] == b"BM":
-        content_type = "image/bmp"
-    elif file_data[:4] in (b"II\x2a\x00", b"MM\x00\x2a"):
-        content_type = "image/tiff"
-    else:
-        content_type = "application/octet-stream"
+        # Detect content type from magic bytes
+        if file_data[:2] == b"\xff\xd8":
+            content_type = "image/jpeg"
+        elif file_data[:4] == b"\x89PNG":
+            content_type = "image/png"
+        elif file_data[:2] == b"BM":
+            content_type = "image/bmp"
+        elif file_data[:4] in (b"II\x2a\x00", b"MM\x00\x2a"):
+            content_type = "image/tiff"
+        else:
+            content_type = "application/octet-stream"
 
-    ts = int(time.time())
-    ext = filename.rsplit(".", 1)[-1]
-    download_name = f"capture_{ts}.{ext}"
+        ts = int(time.time())
+        ext = filename.rsplit(".", 1)[-1]
+        download_name = f"capture_{ts}.{ext}"
 
-    logger.info(f"Returning photo: {len(file_data)} bytes, {content_type}")
-    return Response(
-        content=file_data,
-        media_type=content_type,
-        headers={"Content-Disposition": f"attachment; filename={download_name}"},
-    )
+        logger.info(f"Returning photo: {len(file_data)} bytes, {content_type}")
+        return Response(
+            content=file_data,
+            media_type=content_type,
+            headers={"Content-Disposition": f"attachment; filename={download_name}"},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"API Capture error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Capture failed: {str(e)}"
+        )
 
 
 # ---------------------------------------------------------------------------
