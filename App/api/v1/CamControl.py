@@ -1,4 +1,56 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Body
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status, Body, File, UploadFile
+from fastapi.responses import StreamingResponse, Response, HTMLResponse
+from typing import Optional, Dict
+import time
+import base64
+from App.api.dependencies.auth import get_current_active_user
+from App.api.dependencies.camera import get_camera_streamer, CameraLiveViewStreamer
+from App.core.LoggingInit import get_core_logger
+
+logger = get_core_logger(__name__)
+
+cam_route = APIRouter(prefix="/dslr", tags=["DSLR"])
+
+@cam_route.post("/capture/detailed")
+async def capture_photo_detailed(
+    keep_on_sd: bool = Query(False),
+    clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
+):
+    """Capture a photo and return metadata and image as JSON (Base64)."""
+    try:
+        if not clsr.camera:
+            if not await clsr.start_streaming():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Camera not connected. Start stream first.",
+                )
+
+        file_data, filename, metadata = await clsr.capture_photo(keep_on_sd=keep_on_sd)
+
+        # Encode image as Base64
+        image_b64 = base64.b64encode(file_data).decode("utf-8")
+
+        # Compose response
+        response = {
+            "filename": filename,
+            "format": metadata.get("format", "Unknown"),
+            "width_px": metadata.get("width_px", 0),
+            "height_px": metadata.get("height_px", 0),
+            "dpi": metadata.get("dpi", 300),
+            "width_mm": metadata.get("width_mm", 0.0),
+            "height_mm": metadata.get("height_mm", 0.0),
+            "image_data": image_b64,
+        }
+        return response
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"API Detailed Capture error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Detailed capture failed: {str(e)}",
+        )
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status, Body
 from fastapi.responses import StreamingResponse, Response, HTMLResponse
 from typing import Optional, Dict
 import time
@@ -171,6 +223,7 @@ async def stream_status(
 
 @cam_route.post("/capture")
 async def capture_photo(
+    keep_on_sd: bool = Query(False),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
 ):
     """Capture a high-resolution photo with autonomous hardware synchronization."""
@@ -183,8 +236,7 @@ async def capture_photo(
                     detail="Camera not connected. Start stream first.",
                 )
 
-        file_data, filename = await clsr.capture_photo()
-
+        file_data, filename, metadata = await clsr.capture_photo(keep_on_sd=keep_on_sd)
 
         # Detect content type from magic bytes
         if file_data[:2] == b"\xff\xd8":
@@ -206,8 +258,17 @@ async def capture_photo(
         return Response(
             content=file_data,
             media_type=content_type,
-            headers={"Content-Disposition": f"attachment; filename={download_name}"},
+            headers={
+                "Content-Disposition": f"attachment; filename={download_name}",
+                "X-Image-Width-PX": str(metadata["width_px"]),
+                "X-Image-Height-PX": str(metadata["height_px"]),
+                "X-Image-DPI": str(metadata["dpi"]),
+                "X-Image-Width-MM": str(metadata["width_mm"]),
+                "X-Image-Height-MM": str(metadata["height_mm"]),
+                "X-Image-Format": metadata["format"],
+            },
         )
+
     except HTTPException:
         raise
     except Exception as e:

@@ -73,7 +73,7 @@ class CameraLiveViewStreamer:
     def __init__(self, max_queue_size: int = 10) -> None:
         # Camera state
         self.camera: Optional[gp.Camera] = None
-        self.context: Optional[gp.Context] = None
+        self.context = None  # type: ignore
         self.is_initialized: bool = False
         self.selected_port: Optional[str] = None
         self.camera_model: str = "Unknown"
@@ -268,7 +268,6 @@ class CameraLiveViewStreamer:
         self._set_config_sync("capturetarget", 1)
         return True
 
-
     def _disable_liveview_sync(self) -> None:
         """Disable live-view hardware to release sensor/mirror resources."""
         if not (self.camera and self.is_initialized):
@@ -319,7 +318,6 @@ class CameraLiveViewStreamer:
         finally:
             self.lock.release()
 
-
     def _drain_events_sync(self, timeout_ms: int = 200) -> None:
         """Consume and discard pending hardware events to clear USB buffers."""
         try:
@@ -330,9 +328,9 @@ class CameraLiveViewStreamer:
         except Exception:
             pass
 
-    def _capture_photo_sync(self) -> Tuple[bytes, str]:
-
-
+    def _capture_photo_sync(
+        self, keep_on_sd: bool = False
+    ) -> Tuple[bytes, str, Dict[str, Any]]:
         self._check_circuit_breaker()
         try:
             with self.lock:
@@ -341,14 +339,18 @@ class CameraLiveViewStreamer:
 
                 # 1. ATOMIC STATE SYNC: Load 100% of hardware settings into driver context
                 # This clones the current physical camera state (dials/buttons) into gphoto2
-                logger.info("Atomic Sync: Synchronizing full hardware configuration tree...")
+                logger.info(
+                    "Atomic Sync: Synchronizing full hardware configuration tree..."
+                )
                 try:
                     config = self.camera.get_config(self.context)
                     # Force-Load drive: re-applying the tree locks the hardware state
                     self.camera.set_config(config, self.context)
                     logger.info("Atomic Sync: Complete. Physical settings locked.")
                 except Exception as e:
-                    logger.warning(f"Atomic Sync failed (Viewfinder may be blocking config): {e}")
+                    logger.warning(
+                        f"Atomic Sync failed (Viewfinder may be blocking config): {e}"
+                    )
 
                 # 2. HARDWARE RESET: Disable viewfinder to release mirror/data-bus
                 self._set_config_sync("viewfinder", 0)
@@ -359,9 +361,6 @@ class CameraLiveViewStreamer:
                 # 4. AF-INHIBIT: Ensure lens doesn't hunt if in AF mode
                 self._set_config_sync("autofocusdrive", 0)
 
-
-
-
                 # 7. HARDWARE TRUTH LOGGING: Report what the camera is actually doing
                 config = self.camera.get_config(self.context)
                 try:
@@ -370,28 +369,39 @@ class CameraLiveViewStreamer:
                     shutter = config.get_child_by_name("shutterspeed").get_value()
                     mode = config.get_child_by_name("autoexposuremode").get_value()
 
-                    logger.info(f"HARDWARE TRUTH: [ISO: {iso}] [Apt: {apt}] [Shutter: {shutter}] [Mode: {mode}]")
+                    logger.info(
+                        f"HARDWARE TRUTH: [ISO: {iso}] [Apt: {apt}] [Shutter: {shutter}] [Mode: {mode}]"
+                    )
 
                     if str(mode).lower() not in ("manual", "m"):
-                        logger.warning(f"CAUTION: Camera dial is in '{mode}' mode. Dial settings may override software intent.")
+                        logger.warning(
+                            f"CAUTION: Camera dial is in '{mode}' mode. Dial settings may override software intent."
+                        )
                 except Exception as e:
                     logger.debug(f"Hardware Truth extraction skipped: {e}")
 
                 # 8. SETTLE: Wait for the hardware to stabilize (1.5s for 600D mechanical mirror)
                 time.sleep(1.5)
 
-
                 # 9. CAPTURE with RETRY: Execute the shutter command
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
-                        logger.info(f"Firing shutter (Attempt {attempt+1}/{max_retries})...")
-                        capture_info = self.camera.capture(gp.GP_CAPTURE_IMAGE, self.context)
-                        logger.info(f"Captured: {capture_info.folder}/{capture_info.name}")
+                        logger.info(
+                            f"Firing shutter (Attempt {attempt+1}/{max_retries})..."
+                        )
+                        capture_info = self.camera.capture(
+                            gp.GP_CAPTURE_IMAGE, self.context
+                        )
+                        logger.info(
+                            f"Captured: {capture_info.folder}/{capture_info.name}"
+                        )
                         break
                     except gp.GPhoto2Error as e:
                         if "I/O in progress" in str(e) and attempt < max_retries - 1:
-                            logger.warning(f"I/O in progress (code -110). Draining events and retrying...")
+                            logger.warning(
+                                f"I/O in progress (code -110). Draining events and retrying..."
+                            )
                             self._drain_events_sync(1000)
                             continue
                         raise e
@@ -408,31 +418,37 @@ class CameraLiveViewStreamer:
                 )
                 file_data = bytes(cf.get_data_and_size())
 
-                # 6. CLEANUP: Delete from RAM
-                try:
-                    self.camera.file_delete(
-                        capture_info.folder, capture_info.name, self.context
-                    )
-                except Exception:
-                    pass
+                # 6. CLEANUP: Delete from RAM unless asked to keep
+                if not keep_on_sd:
+                    try:
+                        self.camera.file_delete(
+                            capture_info.folder, capture_info.name, self.context
+                        )
+                    except Exception:
+                        pass
+                else:
+                    logger.info(f"Photo persisted on SD card: {capture_info.name}")
 
             self._on_hardware_success()
 
+            # Metadata extraction
+            metadata = self.extract_image_metadata(file_data, capture_info.name)
+
             # Identify resulting image format
             if file_data[:2] == b"\xff\xd8":
-                return file_data, "photo.jpg"
+                return file_data, "photo.jpg", metadata
 
             try:
                 arr = np.frombuffer(file_data, dtype=np.uint8)
                 img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if img is not None:
                     _, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                    return jpg.tobytes(), "photo.jpg"
+                    return jpg.tobytes(), "photo.jpg", metadata
             except Exception:
                 pass
 
             ext = capture_info.name.rsplit(".", 1)[-1].lower()
-            return file_data, f"photo.{ext}"
+            return file_data, f"photo.{ext}", metadata
 
         except gp.GPhoto2Error as e:
             self._on_hardware_error(e)
@@ -440,6 +456,75 @@ class CameraLiveViewStreamer:
         except Exception as e:
             self._on_hardware_error(e)
             raise
+
+    def extract_image_metadata(self, file_data: bytes, filename: str) -> Dict[str, Any]:
+        """Extract pixel dimensions and calculate physical sizing for the image. Hardened for RAW/TIFF."""
+        import struct
+        metadata = {
+            "width_px": 0,
+            "height_px": 0,
+            "dpi": 300,  # Default industrial printing DPI
+            "width_mm": 0.0,
+            "height_mm": 0.0,
+            "format": "Unknown",
+        }
+
+        # Hardened Magic Byte detection for RAW/TIFF
+        if file_data[:2] == b"\xff\xd8":
+            metadata["format"] = "JPEG"
+        elif file_data[:4] in (b"II*\x00", b"MM\x00*"):
+            # TIFF (RAW) - Canon CR2, Nikon NEF, Sony ARW, etc.
+            metadata["format"] = "RAW"
+        elif file_data[:2] == b"BM":
+            metadata["format"] = "BMP"
+        elif file_data[:4] == b"\x89PNG":
+            metadata["format"] = "PNG"
+        else:
+            # Try to detect by extension if magic bytes fail
+            ext = filename.rsplit('.', 1)[-1].lower()
+            if ext in ("cr2", "nef", "arw", "tiff", "dng"):
+                metadata["format"] = "RAW"
+
+        # Resolution extraction for JPEGs
+        if metadata["format"] == "JPEG":
+            try:
+                arr = np.frombuffer(file_data, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+                if img is not None:
+                    h, w = img.shape[:2]
+                    metadata["width_px"] = w
+                    metadata["height_px"] = h
+                    metadata["width_mm"] = round((w / metadata["dpi"]) * 25.4, 2)
+                    metadata["height_mm"] = round((h / metadata["dpi"]) * 25.4, 2)
+            except Exception as e:
+                logger.debug(f"Metadata extraction failed: {e}")
+
+        # Resolution extraction for TIFF/RAW (very basic, for II*/MM* TIFF)
+        elif metadata["format"] == "RAW":
+            try:
+                # TIFF header: offset 4 is IFD (Image File Directory)
+                endian = "<" if file_data[:2] == b"II" else ">"
+                ifd_offset = struct.unpack(endian + "I", file_data[4:8])[0]
+                # Read number of directory entries
+                num_entries = struct.unpack(endian + "H", file_data[ifd_offset:ifd_offset+2])[0]
+                for i in range(num_entries):
+                    entry_offset = ifd_offset + 2 + i * 12
+                    tag = struct.unpack(endian + "H", file_data[entry_offset:entry_offset+2])[0]
+                    if tag == 256:  # ImageWidth
+                        val = struct.unpack(endian + "I", file_data[entry_offset+8:entry_offset+12])[0]
+                        metadata["width_px"] = val
+                    elif tag == 257:  # ImageLength
+                        val = struct.unpack(endian + "I", file_data[entry_offset+8:entry_offset+12])[0]
+                        metadata["height_px"] = val
+                w = metadata["width_px"]
+                h = metadata["height_px"]
+                if w and h:
+                    metadata["width_mm"] = round((w / metadata["dpi"]) * 25.4, 2)
+                    metadata["height_mm"] = round((h / metadata["dpi"]) * 25.4, 2)
+            except Exception as e:
+                logger.debug(f"RAW metadata extraction failed: {e}")
+
+        return metadata
 
     def _set_config_sync(self, name: str, value: Any) -> bool:
         """Set a camera configuration parameter with smart type-casting and validation."""
@@ -653,10 +738,11 @@ class CameraLiveViewStreamer:
             await self._run(self._cleanup_camera_sync)
         logger.info("Streaming stopped")
 
-    async def capture_photo(self) -> Tuple[bytes, str]:
-
+    async def capture_photo(
+        self, keep_on_sd: bool = False
+    ) -> Tuple[bytes, str, Dict[str, Any]]:
         """
-        Capture high-resolution photo with stream-pause and settings injection logic.
+        Capture high-resolution photo with autonomous hardware synchronization.
         """
         async with self._async_lock:
             was_streaming = self.is_streaming
@@ -666,20 +752,20 @@ class CameraLiveViewStreamer:
                 logger.info("Pausing live-view for high-res capture...")
                 self._streaming_event.clear()
                 # Give the mirror and sensor time to reset
-                await asyncio.sleep(1.2)
+                await asyncio.sleep(1.5)
 
             try:
                 # Step 2: Execute actual autonomous capture
                 # The sync helper now handles its own hardware scrape and state locking
-                image_data, filename = await self._run(self._capture_photo_sync)
-                return image_data, filename
+                res = await self._run(self._capture_photo_sync, keep_on_sd)
+                return res
             finally:
                 # Step 3: Always resume stream if it was active
                 if was_streaming:
                     logger.info("Resuming live-view...")
                     # Re-enable hardware liveview
                     await self._run(self._set_config_sync, "viewfinder", 1)
-                    
+
                     self._streaming_event.set()
                     loop = asyncio.get_running_loop()
                     self.stream_thread = threading.Thread(
@@ -689,7 +775,6 @@ class CameraLiveViewStreamer:
                         name="camera-stream",
                     )
                     self.stream_thread.start()
-
 
     async def generate_mjpeg_stream(self):
         """
