@@ -797,7 +797,7 @@ class CameraLiveViewStreamer:
             logger.info(f"Pausing stream for SD card access at: {folder}")
             self._streaming_event.clear()
             self._disable_liveview_sync()
-            
+
             # Wait for camera to finish its last preview frame cycle
             try:
                 self.camera.wait_for_event(300, self.context)
