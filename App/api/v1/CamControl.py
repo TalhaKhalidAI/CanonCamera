@@ -39,7 +39,9 @@ async def connect_camera(
     if not port:
         cameras = await clsr.detect_usb_cameras()
         if not cameras:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No cameras detected")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="No cameras detected"
+            )
         port = cameras[0]["port"]
         logger.info(f"Auto-selecting camera at {port}")
 
@@ -47,7 +49,7 @@ async def connect_camera(
     if not success:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to connect to camera"
+            detail="Failed to connect to camera",
         )
     return {"status": "connected", "port": port}
 
@@ -55,6 +57,7 @@ async def connect_camera(
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
+
 
 @cam_route.get("/settings")
 async def get_settings(
@@ -66,8 +69,7 @@ async def get_settings(
         return {"status": "success", "settings": settings}
     except Exception as e:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
         )
 
 
@@ -82,8 +84,7 @@ async def update_settings(
         return {"status": "success", **result}
     except Exception as e:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
         )
 
 
@@ -91,11 +92,12 @@ async def update_settings(
 # Stream control
 # ---------------------------------------------------------------------------
 
+
 @cam_route.post("/start")
 async def start_stream(
     port: Optional[str] = None,
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-   # _user=Depends(get_current_active_user),
+    # _user=Depends(get_current_active_user),
 ):
     """Start the camera live stream."""
     if clsr.is_streaming:
@@ -121,7 +123,7 @@ async def start_stream(
 @cam_route.post("/stop")
 async def stop_stream(
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-   ## _user=Depends(get_current_active_user),
+    ## _user=Depends(get_current_active_user),
 ):
     """Stop the camera live stream."""
     await clsr.stop_streaming()
@@ -132,7 +134,7 @@ async def stop_stream(
 async def live_stream(
     port: Optional[str] = None,
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-   # _user=Depends(get_current_active_user),
+    # _user=Depends(get_current_active_user),
 ):
     """MJPEG live stream endpoint."""
     if not clsr.is_streaming:
@@ -155,7 +157,7 @@ async def live_stream(
 @cam_route.get("/status")
 async def stream_status(
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-   # _user=Depends(get_current_active_user),
+    # _user=Depends(get_current_active_user),
 ):
     """Get current streaming status."""
     info = clsr.get_status()
@@ -166,11 +168,12 @@ async def stream_status(
 # Capture
 # ---------------------------------------------------------------------------
 
+
 @cam_route.post("/capture")
 async def capture_photo(
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
 ):
-    """Capture a high-resolution photo."""
+    """Capture a high-resolution photo with autonomous hardware synchronization."""
     try:
         if not clsr.camera:
             # Try to connect if not already connected
@@ -181,6 +184,7 @@ async def capture_photo(
                 )
 
         file_data, filename = await clsr.capture_photo()
+
 
         # Detect content type from magic bytes
         if file_data[:2] == b"\xff\xd8":
@@ -210,7 +214,7 @@ async def capture_photo(
         logger.error(f"API Capture error: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Capture failed: {str(e)}"
+            detail=f"Capture failed: {str(e)}",
         )
 
 
@@ -218,11 +222,16 @@ async def capture_photo(
 # Health / Test (public — no auth)
 # ---------------------------------------------------------------------------
 
+
 @cam_route.get("/health")
 async def camera_health(clsr: CameraLiveViewStreamer = Depends(get_camera_streamer)):
     """Check camera connectivity. Read-only, no auth required."""
     if not clsr.camera:
-        return {"status": "unhealthy", "message": "Camera not connected", "timestamp": time.time()}
+        return {
+            "status": "unhealthy",
+            "message": "Camera not connected",
+            "timestamp": time.time(),
+        }
     # Use streaming status as a lightweight liveness signal — no extra capture
     info = clsr.get_status()
     return {
@@ -242,14 +251,14 @@ async def test_endpoint():
         "status": "operational",
         "timestamp": time.time(),
         "endpoints": [
-            {"path": "/dslr/detect",    "method": "GET",  "auth": True},
-            {"path": "/dslr/connect",   "method": "POST", "auth": True},
-            {"path": "/dslr/livestream","method": "GET",  "auth": True},
-            {"path": "/dslr/start",     "method": "POST", "auth": True},
-            {"path": "/dslr/stop",      "method": "POST", "auth": True},
-            {"path": "/dslr/status",    "method": "GET",  "auth": True},
-            {"path": "/dslr/capture",   "method": "POST", "auth": True},
-            {"path": "/dslr/health",    "method": "GET",  "auth": False},
+            {"path": "/dslr/detect", "method": "GET", "auth": True},
+            {"path": "/dslr/connect", "method": "POST", "auth": True},
+            {"path": "/dslr/livestream", "method": "GET", "auth": True},
+            {"path": "/dslr/start", "method": "POST", "auth": True},
+            {"path": "/dslr/stop", "method": "POST", "auth": True},
+            {"path": "/dslr/status", "method": "GET", "auth": True},
+            {"path": "/dslr/capture", "method": "POST", "auth": True},
+            {"path": "/dslr/health", "method": "GET", "auth": False},
         ],
     }
 
@@ -257,6 +266,7 @@ async def test_endpoint():
 # ---------------------------------------------------------------------------
 # Web UI (public — informational only)
 # ---------------------------------------------------------------------------
+
 
 @cam_route.get("/select", response_class=HTMLResponse)
 async def camera_selection_page():

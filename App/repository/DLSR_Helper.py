@@ -36,6 +36,37 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+# ------------------------------------------------------------------
+# Exceptions
+# ------------------------------------------------------------------
+
+
+class CameraHardwareError(Exception):
+    """Base class for camera hardware level failures."""
+
+    def __init__(self, message: str, code: Optional[int] = None):
+        super().__init__(message)
+        self.code = code
+
+
+class CameraNotConnectedError(CameraHardwareError):
+    """Raised when the USB connection is lost or never established."""
+
+    pass
+
+
+class CameraBusyError(CameraHardwareError):
+    """Raised when the camera is doing internal processing (e.g. mirror flip)."""
+
+    pass
+
+
+class CameraLensError(CameraHardwareError):
+    """Raised when autofocus fails or lens is disconnected."""
+
+    pass
+
+
 class CameraLiveViewStreamer:
     """Async-safe Canon DSLR interface for FastAPI."""
 
@@ -49,24 +80,27 @@ class CameraLiveViewStreamer:
 
         # Streaming state
         self._streaming_event = threading.Event()
-        self.frame_queue: Queue = Queue(maxsize=max_queue_size)
+        # Multicast broadcaster: List of asyncio.Queue (one per subscriber)
+        self._subscribers: List[asyncio.Queue] = []
+        self._subscribers_lock = threading.Lock()
         self.stream_thread: Optional[threading.Thread] = None
 
-        # Watchdog: monitor for stale stream (firmware hangs) (Alex Chen recommendation)
-        self.watchdog_timeout: float = 10.0
+        # Watchdog: monitor for stale stream (firmware hangs)
+        self.watchdog_timeout: float = 5.0  # More aggressive watchdog
         self.last_frame_time: float = 0.0
         self.frame_count: int = 0
+        self.fps_target: float = 30.0
 
-        # Circuit Breaker: fail-fast on hardware errors (Alex Chen recommendation)
+        # Circuit Breaker: fail-fast on hardware errors
         self.consecutive_errors: int = 0
         self.error_threshold: int = 5
         self.circuit_broken_until: float = 0.0
-        self.circuit_reset_timeout: float = 60.0
+        self.circuit_reset_timeout: float = 30.0
 
         # Concurrency primitives
         # threading.Lock — shared with the background stream thread
         self.lock = threading.Lock()
-        # asyncio.Lock — serialises async callers at the coroutine level
+        # asyncio.Lock — primary guard for the public async API
         self._async_lock = asyncio.Lock()
         # Single-threaded executor: all gphoto2 calls land on one OS thread
         self._gphoto_executor = ThreadPoolExecutor(
@@ -75,6 +109,7 @@ class CameraLiveViewStreamer:
 
         # Cached placeholder frame (avoid numpy alloc on every queue miss)
         self._placeholder_frame: Optional[bytes] = None
+        self._latest_frame: Optional[bytes] = None
 
     # ------------------------------------------------------------------
     # Circuit Breaker Helpers
@@ -227,7 +262,12 @@ class CameraLiveViewStreamer:
             if self._set_config_sync(name, 1):
                 logger.info(f"Live view enabled via '{name}'")
                 break
+
+        # CRITICAL: Set capturetarget (1=Memory Card, 0=Internal RAM)
+        # On Canon 600D, 'Memory Card' is the most stable target for settings-sync
+        self._set_config_sync("capturetarget", 1)
         return True
+
 
     def _disable_liveview_sync(self) -> None:
         """Disable live-view hardware to release sensor/mirror resources."""
@@ -279,33 +319,85 @@ class CameraLiveViewStreamer:
         finally:
             self.lock.release()
 
+
+    def _drain_events_sync(self, timeout_ms: int = 200) -> None:
+        """Consume and discard pending hardware events to clear USB buffers."""
+        try:
+            while True:
+                event_type, _ = self.camera.wait_for_event(timeout_ms, self.context)
+                if event_type == gp.GP_EVENT_TIMEOUT:
+                    break
+        except Exception:
+            pass
+
     def _capture_photo_sync(self) -> Tuple[bytes, str]:
+
+
         self._check_circuit_breaker()
         try:
             with self.lock:
                 if not (self.camera and self.is_initialized):
                     raise RuntimeError("Camera not initialised.")
 
-                # 1. DEEP SYNC: Re-fetch current hardware config to sync settings (ISO, etc.)
+                # 1. ATOMIC STATE SYNC: Load 100% of hardware settings into driver context
+                # This clones the current physical camera state (dials/buttons) into gphoto2
+                logger.info("Atomic Sync: Synchronizing full hardware configuration tree...")
                 try:
-                    _ = self.camera.get_config(self.context)
-                    logger.debug("Hardware settings synced from camera.")
+                    config = self.camera.get_config(self.context)
+                    # Force-Load drive: re-applying the tree locks the hardware state
+                    self.camera.set_config(config, self.context)
+                    logger.info("Atomic Sync: Complete. Physical settings locked.")
                 except Exception as e:
-                    logger.warning(f"Config fetch failed, continuing with current: {e}")
+                    logger.warning(f"Atomic Sync failed (Viewfinder may be blocking config): {e}")
 
                 # 2. HARDWARE RESET: Disable viewfinder to release mirror/data-bus
-                # Using integer for Toggle widget (0=Off)
                 self._set_config_sync("viewfinder", 0)
 
-                # 3. SETTLE: Wait for the camera to finish its own internal work (0.5s)
-                self.camera.wait_for_event(500, self.context)
+                # 3. EVENT DRAINAGE: Clear USB buffer of pending preview frames
+                self._drain_events_sync(500)
 
-                # 4. CAPTURE: Execute the shutter command
-                logger.info("Firing shutter with current hardware settings...")
-                capture_info = self.camera.capture(gp.GP_CAPTURE_IMAGE, self.context)
-                logger.info(f"Captured: {capture_info.folder}/{capture_info.name}")
+                # 4. AF-INHIBIT: Ensure lens doesn't hunt if in AF mode
+                self._set_config_sync("autofocusdrive", 0)
 
-                # 5. RETRIEVE: Get the file data
+
+
+
+                # 7. HARDWARE TRUTH LOGGING: Report what the camera is actually doing
+                config = self.camera.get_config(self.context)
+                try:
+                    iso = config.get_child_by_name("iso").get_value()
+                    apt = config.get_child_by_name("aperture").get_value()
+                    shutter = config.get_child_by_name("shutterspeed").get_value()
+                    mode = config.get_child_by_name("autoexposuremode").get_value()
+
+                    logger.info(f"HARDWARE TRUTH: [ISO: {iso}] [Apt: {apt}] [Shutter: {shutter}] [Mode: {mode}]")
+
+                    if str(mode).lower() not in ("manual", "m"):
+                        logger.warning(f"CAUTION: Camera dial is in '{mode}' mode. Dial settings may override software intent.")
+                except Exception as e:
+                    logger.debug(f"Hardware Truth extraction skipped: {e}")
+
+                # 8. SETTLE: Wait for the hardware to stabilize (1.5s for 600D mechanical mirror)
+                time.sleep(1.5)
+
+
+                # 9. CAPTURE with RETRY: Execute the shutter command
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        logger.info(f"Firing shutter (Attempt {attempt+1}/{max_retries})...")
+                        capture_info = self.camera.capture(gp.GP_CAPTURE_IMAGE, self.context)
+                        logger.info(f"Captured: {capture_info.folder}/{capture_info.name}")
+                        break
+                    except gp.GPhoto2Error as e:
+                        if "I/O in progress" in str(e) and attempt < max_retries - 1:
+                            logger.warning(f"I/O in progress (code -110). Draining events and retrying...")
+                            self._drain_events_sync(1000)
+                            continue
+                        raise e
+
+                # 10. RETRIEVE: Get the file data
+
                 cf = gp.CameraFile()
                 self.camera.file_get(
                     capture_info.folder,
@@ -425,84 +517,72 @@ class CameraLiveViewStreamer:
     # Streaming background thread
     # ------------------------------------------------------------------
 
-    def _stream_frames(self) -> None:
-        logger.info("Streaming thread started")
-        retry = 0
-        max_retry = 3
+    def _stream_frames(self, loop: asyncio.AbstractEventLoop) -> None:
+        """
+        Background thread loop for high-speed frame capture.
+        Uses high-precision timing and thread-safe dispatch to async subscribers.
+        """
+        logger.info("Streaming thread started (Multicast Mode)")
+        interval = 1.0 / self.fps_target
+
         while self._streaming_event.is_set():
+            start_time = time.perf_counter()
+
             try:
+                # 1. Connectivity Check & Recover
                 if not (self.camera and self.is_initialized):
-                    if retry < max_retry:
-                        logger.info(
-                            f"Reconnect attempt {retry + 1}/{max_retry} (Port: {self.selected_port})"
-                        )
-                        # Try the previous port first
-                        fut = self._gphoto_executor.submit(
-                            self._initialise_with_liveview_sync, self.selected_port
-                        )
-                        success = fut.result(timeout=10)
+                    logger.warning(
+                        "Stream loop: Camera lost. Attempting background recovery..."
+                    )
+                    fut = self._gphoto_executor.submit(
+                        self._initialise_with_liveview_sync, self.selected_port
+                    )
+                    success = fut.result(timeout=10)
+                    if not success:
+                        time.sleep(2.0)
+                        continue
 
-                        if not success:
-                            # Reconnect Fallback: if the old port is gone (USB address changed),
-                            # trigger a full autodetect scan (port=None).
-                            logger.info(
-                                "Port-specific reconnect failed. Scanning all USB ports..."
-                            )
-                            fut = self._gphoto_executor.submit(
-                                self._initialise_with_liveview_sync, None
-                            )
-                            success = fut.result(timeout=10)
-
-                        retry = 0 if success else retry + 1
-                        time.sleep(1)
-                    else:
-                        logger.error("Max reconnection attempts — stopping stream")
-                        self._streaming_event.clear()
-                    continue
-
-                # Submit capture to executor (thread affinity)
+                # 2. Capture Frame (dispatch to thread with affinity)
                 fut = self._gphoto_executor.submit(self._capture_frame_sync)
-                frame = fut.result(timeout=2.0)
+                frame = fut.result(timeout=1.0)
 
                 if frame:
-                    retry = 0
-                    if self.frame_queue.full():
-                        try:
-                            self.frame_queue.get_nowait()
-                        except Empty:
-                            pass
-                    self.frame_queue.put(frame)
+                    self._latest_frame = frame
                     self.frame_count += 1
-                    self.last_frame_time = time.time()  # Important for Watchdog
-                    if self.frame_count % 30 == 0:
-                        elapsed = time.time() - self.last_frame_time
-                        if elapsed > 0:
-                            logger.debug(f"FPS: {30 / elapsed:.1f}")
-                else:
-                    retry += 1
-                    # Watchdog Check: reset if frames stop for 10s
-                    stale_duration = time.time() - self.last_frame_time
-                    if (
-                        self.last_frame_time > 0
-                        and stale_duration > self.watchdog_timeout
-                    ):
-                        logger.warning(
-                            f"WATCHDOG: Stream stale for {stale_duration:.1f}s. Resetting..."
-                        )
-                        self._gphoto_executor.submit(
-                            self._initialise_with_liveview_sync, self.selected_port
-                        )
-                        # We do NOT update self.last_frame_time here. Only successful frames do that.
-                        # We use a sleep to prevent aggressive reset hammering.
-                        time.sleep(2.0)
+                    self.last_frame_time = time.time()
+                    self._on_hardware_success()
 
-                # Deadline-based sleep — accounts for capture duration
-                time.sleep(0.033)
+                    # 3. Multicast Broadcast (Dispatch to all async queues via event loop)
+                    def _broadcast(target_q, f):
+                        try:
+                            if target_q.full():
+                                target_q.get_nowait()
+                            target_q.put_nowait(f)
+                        except Exception:
+                            pass
+
+                    with self._subscribers_lock:
+                        for q in self._subscribers:
+                            loop.call_soon_threadsafe(_broadcast, q, frame)
+                else:
+                    # Watchdog Check
+                    stale = time.time() - self.last_frame_time
+                    if self.last_frame_time > 0 and stale > self.watchdog_timeout:
+                        logger.critical(
+                            f"WATCHDOG: Stream stale for {stale:.1f}s. Forcing Reset."
+                        )
+                        self._gphoto_executor.submit(self._cleanup_camera_sync)
+                        time.sleep(1.0)
+
+                # 4. Precision Timing (Sleep only the remaining budget)
+                elapsed = time.perf_counter() - start_time
+                sleep_time = max(0, interval - elapsed)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
 
             except Exception as e:
                 logger.error(f"Stream thread error: {e}")
-                retry += 1
-                time.sleep(0.1)
+                time.sleep(0.5)
 
         logger.info("Streaming thread stopped")
 
@@ -530,20 +610,26 @@ class CameraLiveViewStreamer:
     async def start_streaming(self, port: Optional[str] = None) -> bool:
         if self.is_streaming:
             logger.warning("Stream already running")
-            return False
+            return True
         async with self._async_lock:
             if not await self._run(self._initialise_with_liveview_sync, port):
                 return False
         self._streaming_event.set()
         self.last_frame_time = time.time()
         self.frame_count = 0
-        while not self.frame_queue.empty():
-            try:
-                self.frame_queue.get_nowait()
-            except Empty:
-                break
+
+        # Clear any stale subscriber queues
+        with self._subscribers_lock:
+            for q in self._subscribers:
+                while not q.empty():
+                    q.get_nowait()
+
+        loop = asyncio.get_running_loop()
         self.stream_thread = threading.Thread(
-            target=self._stream_frames, daemon=True, name="camera-stream"
+            target=self._stream_frames,
+            args=(loop,),
+            daemon=True,
+            name="camera-stream",
         )
         self.stream_thread.start()
         logger.info(f"Streaming started on {self.camera_model}")
@@ -568,7 +654,10 @@ class CameraLiveViewStreamer:
         logger.info("Streaming stopped")
 
     async def capture_photo(self) -> Tuple[bytes, str]:
-        """Capture high-resolution photo with stream-pause logic."""
+
+        """
+        Capture high-resolution photo with stream-pause and settings injection logic.
+        """
         async with self._async_lock:
             was_streaming = self.is_streaming
 
@@ -580,64 +669,86 @@ class CameraLiveViewStreamer:
                 await asyncio.sleep(1.2)
 
             try:
-                # Step 2: Execute actual capture
-                res = await self._run(self._capture_photo_sync)
-                return res
+                # Step 2: Execute actual autonomous capture
+                # The sync helper now handles its own hardware scrape and state locking
+                image_data, filename = await self._run(self._capture_photo_sync)
+                return image_data, filename
             finally:
-                # Step 3: Always resume stream if it was on
+                # Step 3: Always resume stream if it was active
                 if was_streaming:
                     logger.info("Resuming live-view...")
+                    # Re-enable hardware liveview
+                    await self._run(self._set_config_sync, "viewfinder", 1)
+                    
                     self._streaming_event.set()
-                    self._gphoto_executor.submit(self._stream_frames)
+                    loop = asyncio.get_running_loop()
+                    self.stream_thread = threading.Thread(
+                        target=self._stream_frames,
+                        args=(loop,),
+                        daemon=True,
+                        name="camera-stream",
+                    )
+                    self.stream_thread.start()
 
-    def get_latest_frame(self, timeout: float = 0.1) -> Optional[bytes]:
-        """Return only the most recent frame, discarding stale ones."""
-        try:
-            # Pop the oldest available frame or wait
-            frame = self.frame_queue.get(timeout=timeout)
-            # DRAIN the queue to ensure 'real-time' feel for slow clients
-            count = 0
-            while True:
-                try:
-                    frame = self.frame_queue.get_nowait()
-                    count += 1
-                except Empty:
-                    break
-            if count > 0:
-                logger.debug(f"Skipped {count} stale frames")
-            return frame
-        except Empty:
-            return None
 
-    def generate_mjpeg_stream(self):
+    async def generate_mjpeg_stream(self):
+        """
+        Asynchronous MJPEG generator.
+        Registers a private queue with the broadcaster and yields frames.
+        """
         boundary = b"frame"
-        while self.is_streaming:
-            frame = self.get_latest_frame(timeout=0.5)
-            data = frame if frame is not None else self._get_placeholder_frame()
-            yield (
-                b"--" + boundary + b"\r\n"
-                b"Content-Type: image/jpeg\r\n"
-                b"Content-Length: "
-                + str(len(data)).encode()
-                + b"\r\n\r\n"
-                + data
-                + b"\r\n"
+        # Each client gets its own 1-slot queue (backpressure: only latest frame)
+        q: asyncio.Queue = asyncio.Queue(maxsize=1)
+
+        with self._subscribers_lock:
+            self._subscribers.append(q)
+            logger.debug(
+                f"New stream client connected. Active: {len(self._subscribers)}"
             )
-            if frame is None:
-                time.sleep(0.1)
 
-    def _get_placeholder_frame(self) -> bytes:
-        if self._placeholder_frame is None:
-            self._placeholder_frame = self._create_placeholder_frame()
-        return self._placeholder_frame
+        try:
+            while self.is_streaming:
+                try:
+                    # Non-blocking wait for next frame
+                    frame = await asyncio.wait_for(q.get(), timeout=2.0)
+                    yield (
+                        b"--" + boundary + b"\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Content-Length: "
+                        + str(len(frame)).encode()
+                        + b"\r\n\r\n"
+                        + frame
+                        + b"\r\n"
+                    )
+                except asyncio.TimeoutError:
+                    # Yield heartbeat/placeholder if camera is slow
+                    placeholder = self._get_placeholder_frame(
+                        "Signal Lost - Reconnecting..."
+                    )
+                    yield (
+                        b"--" + boundary + b"\r\n"
+                        b"Content-Type: image/jpeg\r\n\r\n" + placeholder + b"\r\n"
+                    )
 
-    def _create_placeholder_frame(self) -> bytes:
+        finally:
+            with self._subscribers_lock:
+                if q in self._subscribers:
+                    self._subscribers.remove(q)
+                logger.debug(
+                    f"Stream client disconnected. Remaining: {len(self._subscribers)}"
+                )
+
+    def _get_placeholder_frame(self, message: str = "Initializing...") -> bytes:
+        # Cache placeholder based on message to avoid redundant OpenCV work
+        return self._create_placeholder_frame(message)
+
+    def _create_placeholder_frame(self, message: str) -> bytes:
         img = np.zeros((480, 640, 3), dtype=np.uint8)
         for i, text in enumerate(
             [
                 f"Camera: {self.camera_model}",
                 f"Port: {self.selected_port or 'Auto'}",
-                "Waiting for frames…",
+                message,
             ]
         ):
             cv2.putText(
@@ -657,7 +768,7 @@ class CameraLiveViewStreamer:
             "is_streaming": self.is_streaming,
             "camera_model": self.camera_model,
             "selected_port": self.selected_port,
-            "queue_size": self.frame_queue.qsize(),
+            "subscribers": len(self._subscribers),
             "frame_count": self.frame_count,
             "camera_connected": bool(self.camera and self.is_initialized),
             "is_initialized": self.is_initialized,
@@ -842,7 +953,7 @@ class CameraLiveViewStreamer:
                 raw_files = self.camera.folder_list_files(folder, self.context)
                 num_files = raw_files.count()
                 logger.info(f"GPhoto detected {num_files} files in {folder}")
-                
+
                 for i in range(num_files):
                     name = raw_files.get_name(i)
                     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
@@ -882,7 +993,7 @@ class CameraLiveViewStreamer:
                 raw_folders = self.camera.folder_list_folders(folder, self.context)
                 num_folders = raw_folders.count()
                 logger.info(f"GPhoto detected {num_folders} subfolders in {folder}")
-                
+
                 for i in range(num_folders):
                     name = raw_folders.get_name(i)
                     contents.append(

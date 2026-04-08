@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DSLR Pro-Stream Console</title>
+    <!-- Google Fonts: Inter -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #0f172a;
+            --card-bg: rgba(30, 41, 59, 0.7);
+            --primary: #06b6d4;
+            --secondary: #d946ef;
+            --success: #10b981;
+            --danger: #ef4444;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --glass-border: rgba(255, 255, 255, 0.1);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-dark);
+            background-image:
+                radial-gradient(at 0% 0%, rgba(6, 182, 212, 0.15) 0px, transparent 50%),
+                radial-gradient(at 100% 100%, rgba(217, 70, 239, 0.15) 0px, transparent 50%);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .dashboard {
+            width: 100%;
+            max-width: 1100px;
+            display: grid;
+            grid-template-columns: 1fr 320px;
+            gap: 24px;
+        }
+
+        /* Glassmorphism Card */
+        .glass-card {
+            background: var(--card-bg);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--glass-border);
+            border-radius: 20px;
+            padding: 24px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+        }
+
+        .header {
+            grid-column: 1 / -1;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            letter-spacing: -0.025em;
+            background: linear-gradient(to right, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .badge {
+            padding: 4px 12px;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            background: rgba(16, 185, 129, 0.2);
+            color: var(--success);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+        }
+
+        .badge.offline {
+            background: rgba(239, 68, 68, 0.2);
+            color: var(--danger);
+            border-color: rgba(239, 68, 68, 0.3);
+        }
+
+        /* Viewport Section */
+        .viewport-section {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .stream-viewport {
+            position: relative;
+            background: #000;
+            border-radius: 16px;
+            aspect-ratio: 16/9;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            border: 2px solid var(--glass-border);
+        }
+
+        #cameraStream {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+
+        .stream-overlay {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            display: flex;
+            gap: 8px;
+        }
+
+        .overlay-pill {
+            background: rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(4px);
+            padding: 6px 10px;
+            border-radius: 8px;
+            font-size: 0.7rem;
+            font-weight: 600;
+            font-family: monospace;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--danger);
+            box-shadow: 0 0 10px var(--danger);
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.3;
+            }
+
+            100% {
+                opacity: 1;
+            }
+        }
+
+        /* Controls Section */
+        .controls {
+            display: flex;
+            gap: 12px;
+        }
+
+        .btn {
+            flex: 1;
+            padding: 12px;
+            border-radius: 12px;
+            font-weight: 600;
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+            border: 1px solid transparent;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            font-family: inherit;
+        }
+
+        .btn-primary {
+            background: var(--primary);
+            color: var(--bg-dark);
+        }
+
+        .btn-primary:hover {
+            background: #22d3ee;
+            transform: translateY(-1px);
+            box-shadow: 0 10px 15px -3px rgba(6, 182, 212, 0.4);
+        }
+
+        .btn-danger {
+            background: rgba(239, 68, 68, 0.1);
+            color: var(--danger);
+            border-color: rgba(239, 68, 68, 0.2);
+        }
+
+        .btn-danger:hover {
+            background: rgba(239, 68, 68, 0.2);
+        }
+
+        .btn-shutter {
+            background: #fff;
+            color: var(--bg-dark);
+            height: 56px;
+            border-radius: 16px;
+            font-size: 1rem;
+            box-shadow: 0 0 20px rgba(255, 255, 255, 0.2);
+        }
+
+        .btn-shutter:hover {
+            transform: scale(1.02);
+        }
+
+        .btn-shutter:active {
+            transform: scale(0.98);
+        }
+
+        /* Sidebar stats */
+        .sidebar {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .stat-group {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .stat-card {
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 12px;
+            padding: 16px;
+            border: 1px solid var(--glass-border);
+        }
+
+        .stat-label {
+            font-size: 0.7rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 4px;
+        }
+
+        .stat-value {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--text-main);
+        }
+
+        .input-group {
+            margin-bottom: 16px;
+        }
+
+        label {
+            display: block;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+        }
+
+        input {
+            width: 100%;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid var(--glass-border);
+            padding: 10px 14px;
+            border-radius: 10px;
+            color: #fff;
+            font-family: inherit;
+            font-size: 0.85rem;
+        }
+
+        input:focus {
+            outline: none;
+            border-color: var(--primary);
+            background: rgba(0, 0, 0, 0.5);
+        }
+
+        #console {
+            height: 120px;
+            background: #000;
+            border-radius: 12px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            padding: 12px;
+            overflow-y: auto;
+            color: #4ade80;
+            line-height: 1.4;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        @media (max-width: 900px) {
+            .dashboard {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="dashboard">
+        <header class="header">
+            <h1>DSLR Console v2.0</h1>
+            <div id="statusBadge" class="badge offline">System Offline</div>
+        </header>
+
+        <!-- Main Viewport -->
+        <main class="viewport-section">
+            <div class="glass-card">
+                <div class="stream-viewport">
+                    <img id="cameraStream" src="" alt="Live Stream Viewport">
+                    <div class="stream-overlay">
+                        <div class="overlay-pill">
+                            <div class="dot"></div> LIVE
+                        </div>
+                        <div class="overlay-pill">
+                            <span id="fpsCounter">0</span> FPS
+                        </div>
+                    </div>
+                </div>
+
+                <div style="margin-top: 20px;" class="controls">
+                    <button id="btnStart" class="btn btn-primary">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M8 5v14l11-7z" />
+                        </svg>
+                        Power On
+                    </button>
+                    <button id="btnStop" class="btn btn-danger hidden">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M6 6h12v12H6z" />
+                        </svg>
+                        Kill Stream
+                    </button>
+                    <button id="btnCapture" class="btn btn-shutter" disabled>
+                        Capture Shutter
+                    </button>
+                </div>
+            </div>
+
+            <div class="glass-card">
+                <div id="console">Initializing system bus...<br>> Terminal ready. Ready for multicast stream.</div>
+            </div>
+        </main>
+
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="glass-card">
+                <div class="input-group">
+                    <label>Base Station URL</label>
+                    <input type="text" id="baseUrl" value="http://localhost:8000/app/v1/camera/dslr">
+                </div>
+
+                <div class="stat-group">
+                    <div class="stat-card">
+                        <div class="stat-label">Multicast Subscribers</div>
+                        <div class="stat-value" id="subCount">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Detected Hardware</div>
+                        <div class="stat-value" id="camModel">Scan Pending...</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Watchdog Pulse</div>
+                        <div class="stat-value" id="pulseTime">0.0s</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="glass-card" style="padding: 16px;">
+                <div class="stat-label" style="text-align: center; margin-bottom: 0;">Async-Lock Active</div>
+            </div>
+        </aside>
+    </div>
+
+    <script>
+        // Store URLs
+        let BASE_URL = document.getElementById('baseUrl').value;
+        const STREAM_IMG = document.getElementById('cameraStream');
+        const CONSOLE = document.getElementById('console');
+
+        let streamActive = false;
+        let lastFrameTimestamp = performance.now();
+        let frameTimes = [];
+
+        function log(msg, type = 'info') {
+            const time = new Date().toLocaleTimeString([], { hour12: false });
+            CONSOLE.innerHTML += `<div class="${type}">[${time}] ${msg}</div>`;
+            CONSOLE.scrollTop = CONSOLE.scrollHeight;
+        }
+
+        async function fetchStatus() {
+            BASE_URL = document.getElementById('baseUrl').value;
+            try {
+                const response = await fetch(`${BASE_URL}/status`);
+                const data = await response.json();
+
+                document.getElementById('subCount').innerText = data.subscribers;
+                document.getElementById('camModel').innerText = data.camera_model;
+                document.getElementById('statusBadge').innerText = data.camera_connected ? 'System Online' : 'Hardware Idle';
+                document.getElementById('statusBadge').className = `badge ${data.camera_connected ? '' : 'offline'}`;
+
+                if (data.is_streaming && !streamActive) {
+                    // Sync state if already streaming elsewhere
+                    toggleStreamUI(true);
+                    STREAM_IMG.src = `${BASE_URL}/livestream?t=${Date.now()}`;
+                } else if (!data.is_streaming && streamActive) {
+                    toggleStreamUI(false);
+                    STREAM_IMG.src = '';
+                }
+            } catch (e) {
+                // Silently wait for server
+            }
+        }
+
+        function toggleStreamUI(active) {
+            streamActive = active;
+            document.getElementById('btnStart').classList.toggle('hidden', active);
+            document.getElementById('btnStop').classList.toggle('hidden', !active);
+            document.getElementById('btnCapture').disabled = !active;
+        }
+
+        async function startStream() {
+            BASE_URL = document.getElementById('baseUrl').value;
+            log('Initiating hardware handshake...');
+
+            try {
+                // Step 1: Tell backend to start streaming thread
+                const res = await fetch(`${BASE_URL}/start`, { method: 'POST' });
+                if (!res.ok) throw new Error('Hardware contention');
+
+                // Step 2: Bind native MJPEG stream
+                log('Handshake successful. Binding MJPEG buffer.');
+                STREAM_IMG.src = `${BASE_URL}/livestream?t=${Date.now()}`;
+                toggleStreamUI(true);
+
+                startFPSCalculator();
+            } catch (e) {
+                log('Hardware connection failed. Is another process using the USB bus?', 'danger');
+            }
+        }
+
+        function stopStream() {
+            log('Releasing sensors...');
+            fetch(`${BASE_URL}/stop`, { method: 'POST' });
+            STREAM_IMG.src = '';
+            toggleStreamUI(false);
+            log('Bus released.');
+        }
+
+        async function capturePhoto() {
+            log('Firing shutter. Pausing stream bus...');
+            const shutterBtn = document.getElementById('btnCapture');
+            shutterBtn.disabled = true;
+
+            try {
+                const response = await fetch(`${BASE_URL}/capture`, { method: 'POST' });
+                if (response.ok) {
+                    const blob = await response.blob();
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `CANCAM_${Date.now()}.jpg`;
+                    a.click();
+                    log('Image captured and retrieved.');
+                }
+            } catch (e) {
+                log('Capture sequence interrupted.', 'danger');
+            } finally {
+                shutterBtn.disabled = false;
+            }
+        }
+
+        function startFPSCalculator() {
+            const frameCounter = () => {
+                if (!streamActive) return;
+
+                const now = performance.now();
+                const diff = now - lastFrameTimestamp;
+                lastFrameTimestamp = now;
+
+                frameTimes.push(diff);
+                if (frameTimes.length > 30) frameTimes.shift();
+
+                const avg = frameTimes.reduce((a, b) => a + b) / frameTimes.length;
+                document.getElementById('fpsCounter').innerText = Math.round(1000 / avg);
+                document.getElementById('pulseTime').innerText = (diff / 1000).toFixed(2) + 's';
+
+                if (streamActive) requestAnimationFrame(frameCounter);
+            };
+            requestAnimationFrame(frameCounter);
+        }
+
+        // Listeners
+        document.getElementById('btnStart').addEventListener('click', startStream);
+        document.getElementById('btnStop').addEventListener('click', stopStream);
+        document.getElementById('btnCapture').addEventListener('click', capturePhoto);
+
+        // Polling
+        setInterval(fetchStatus, 1500);
+
+        // Final Init
+        log('Session established.');
+    </script>
+</body>
+
+</html>
