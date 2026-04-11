@@ -133,6 +133,7 @@ async def detect_cameras(
 async def connect_camera(
     port: Optional[str] = Query(None, description="USB port string, e.g. usb:001,005"),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
+    save_to_sd: bool = Query(True),
     # _user=Depends(get_current_active_user),  # TODO: enable
 ):
     """Connect to a specific camera port, or auto-select the first detected."""
@@ -147,7 +148,7 @@ async def connect_camera(
             port = cameras[0]["port"]
             logger.info("Auto-selected camera at port %s", port)
 
-        success = await clsr.connect_to_camera(port)
+        success = await clsr.connect_to_camera(port,save_to_sd=save_to_sd)
         if not success:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -205,8 +206,10 @@ async def update_settings(
 
 @cam_route.post("/start")
 async def start_stream(
+    
     port: Optional[str] = Query(None),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
+    save_to_sd: bool = Query(True, description="Save photos to SD card"),
     # _user=Depends(get_current_active_user),  # TODO: enable
 ):
     """Start the camera live-view stream."""
@@ -218,7 +221,7 @@ async def start_stream(
             "stream_url": f"{API_PREFIX}/livestream",
         }
     try:
-        success = await clsr.start_streaming(port)
+        success = await clsr.start_streaming(port,save_to_sd=save_to_sd)
     except Exception as exc:
         raise _map_hardware_error(exc)
 

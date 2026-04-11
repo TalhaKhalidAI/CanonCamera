@@ -300,7 +300,7 @@ class CameraLiveViewStreamer:
         logger.info("Camera ready: %s", self.camera_model)
         return True
 
-    def _initialise_with_liveview_sync(self, port: Optional[str] = None) -> bool:
+    def _initialise_with_liveview_sync(self, port: Optional[str] = None,save_to_sd: bool=True) -> bool:
         """Connect + enable live-view.  Runs on executor thread."""
         self._cleanup_camera_sync()
         cameras = self._detect_usb_cameras_sync()
@@ -322,8 +322,34 @@ class CameraLiveViewStreamer:
             if self._set_config_sync(name, 1):
                 logger.info("Live-view enabled via '%s'.", name)
                 break
+        
+        try:
+            config = self.camera.get_config(self.context)
+            child = config.get_child_by_name("capturetarget")
+            choices = [str(child.get_choice(i)) for i in range(child.count_choices())]
+            target = None
+            if save_to_sd:
+                for c in choices:
+                    if any(x in c.lower() for x in ["card", "sd", "cf"]):
+                        target = c
+                        break
+                if not target and len(choices) > 1:
+                    target = choices[1]
+            else:
+                for c in choices:
+                    if any(x in c.lower() for x in ["ram", "internal"]):
+                        target = c
+                        break
+                if not target and choices:
+                    target = choices[0]
+            
+            if target:
+                self._set_config_sync("capturetarget", target)
+        except Exception as exc:
+            logger.debug("Dynamic target fail: %s. Fallback to default.", exc)
+            target = "Memory card" if save_to_sd else "Internal RAM"
+            self._set_config_sync("capturetarget", target)
 
-        self._set_config_sync("capturetarget", 1)
         return True
 
     def _disable_liveview_sync(self) -> None:
@@ -722,21 +748,21 @@ class CameraLiveViewStreamer:
     # ------------------------------------------------------------------
     # Public async API — camera / stream
     # ------------------------------------------------------------------
-
+## target = "Memory card" if save_to_sd else "Internal RAM"
     async def detect_usb_cameras(self) -> List[Dict]:
         async with self._async_lock:
             return await self._run(self._detect_usb_cameras_sync)
 
-    async def connect_to_camera(self, port: Optional[str] = None) -> bool:
+    async def connect_to_camera(self, port: Optional[str] = None, save_to_sd: bool = True) -> bool:
         async with self._async_lock:
-            return await self._run(self._initialise_with_liveview_sync, port)
+            return await self._run(self._initialise_with_liveview_sync, port,save_to_sd)
 
-    async def start_streaming(self, port: Optional[str] = None) -> bool:
+    async def start_streaming(self, port: Optional[str] = None, save_to_sd: bool = True) -> bool:
         if self.is_streaming:
             logger.warning("Stream already running.")
             return True
         async with self._async_lock:
-            if not await self._run(self._initialise_with_liveview_sync, port):
+            if not await self._run(self._initialise_with_liveview_sync, port,save_to_sd):
                 return False
         self._streaming_event.set()
         self.last_frame_time = time.time()
