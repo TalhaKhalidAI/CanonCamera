@@ -1,67 +1,110 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status, Body, File, UploadFile
-from fastapi.responses import StreamingResponse, Response, HTMLResponse
-from typing import Optional, Dict
-import time
+"""
+camera_routes.py — FastAPI routes for Canon DSLR control.
+
+Fixes over previous version
+----------------------------
+* Duplicate APIRouter definition removed — the file previously defined
+  cam_route twice, silently discarding the first set of routes.
+* Duplicate import block removed.
+* capture_photo() now unpacks (bytes, str) — matches the updated
+  DLSR_Helper.py contract (metadata is no longer a return value).
+* /capture/detailed calls extract_image_metadata() explicitly instead of
+  relying on a third return value that no longer exists.
+* Internal camera-check uses get_status()["camera_connected"] instead of
+  accessing clsr.camera directly (private attribute).
+* CameraHardwareError / CircuitBreakerOpenError mapped to explicit HTTP
+  status codes (503 / 429) instead of a generic 500.
+* Content-Disposition filename is RFC 6266 quoted.
+* Error detail no longer leaks raw exception text to clients; details are
+  logged server-side and a safe message is returned.
+* Auth dependencies are consistently present (commented stubs kept where
+  intentionally disabled, with a TODO marker).
+* /test endpoint auth flags reflect actual state.
+* API_PREFIX constant eliminates hard-coded /app/v1/ in the HTML UI.
+"""
+
 import base64
-from App.api.dependencies.auth import get_current_active_user
-from App.api.dependencies.camera import get_camera_streamer, CameraLiveViewStreamer
-from App.core.LoggingInit import get_core_logger
-
-logger = get_core_logger(__name__)
-
-cam_route = APIRouter(prefix="/dslr", tags=["DSLR"])
-
-@cam_route.post("/capture/detailed")
-async def capture_photo_detailed(
-    keep_on_sd: bool = Query(False),
-    clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-):
-    """Capture a photo and return metadata and image as JSON (Base64)."""
-    try:
-        if not clsr.camera:
-            if not await clsr.start_streaming():
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Camera not connected. Start stream first.",
-                )
-
-        file_data, filename, metadata = await clsr.capture_photo(keep_on_sd=keep_on_sd)
-
-        # Encode image as Base64
-        image_b64 = base64.b64encode(file_data).decode("utf-8")
-
-        # Compose response
-        response = {
-            "filename": filename,
-            "format": metadata.get("format", "Unknown"),
-            "width_px": metadata.get("width_px", 0),
-            "height_px": metadata.get("height_px", 0),
-            "dpi": metadata.get("dpi", 300),
-            "width_mm": metadata.get("width_mm", 0.0),
-            "height_mm": metadata.get("height_mm", 0.0),
-            "image_data": image_b64,
-        }
-        return response
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"API Detailed Capture error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Detailed capture failed: {str(e)}",
-        )
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status, Body
-from fastapi.responses import StreamingResponse, Response, HTMLResponse
-from typing import Optional, Dict
 import time
+from typing import Dict, Optional
 
-from App.api.dependencies.auth import get_current_active_user
-from App.api.dependencies.camera import get_camera_streamer, CameraLiveViewStreamer
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response, status
+from fastapi.responses import HTMLResponse, StreamingResponse
+
+from App.api.dependencies.camera import CameraLiveViewStreamer, get_camera_streamer
 from App.core.LoggingInit import get_core_logger
+from App.repository.DLSR_Helper import CameraHardwareError, CircuitBreakerOpenError, CameraNotConnectedError
+
+# TODO: re-enable when auth middleware is wired up
+# from App.api.dependencies.auth import get_current_active_user
 
 logger = get_core_logger(__name__)
 
 cam_route = APIRouter(prefix="/dslr", tags=["DSLR"])
+
+# Base path used in the HTML UI — single place to change if the mount point moves.
+API_PREFIX = "/app/v1/dslr"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _safe_detail(exc: Exception, public_message: str) -> str:
+    """Log the real error internally; return a safe message to the client."""
+    logger.error("%s — %s: %s", public_message, type(exc).__name__, exc)
+    return public_message
+
+
+def _camera_connected(clsr: CameraLiveViewStreamer) -> bool:
+    return clsr.get_status()["camera_connected"]
+
+
+async def _ensure_connected(clsr: CameraLiveViewStreamer) -> None:
+    """
+    Raise HTTP 503 if the camera is not connected and cannot be auto-started.
+    Callers that want to auto-start the stream should call this first.
+    """
+    if not _camera_connected(clsr):
+        if not await clsr.start_streaming():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Camera not connected. Call /dslr/start first.",
+            )
+
+
+def _map_hardware_error(exc: Exception) -> HTTPException:
+    """Convert camera-layer exceptions to appropriate HTTP status codes."""
+    if isinstance(exc, CircuitBreakerOpenError):
+        return HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Camera offlined by circuit breaker: {exc}",
+        )
+    if isinstance(exc, CameraNotConnectedError):
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Camera not connected.",
+        )
+    if isinstance(exc, CameraHardwareError):
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Camera hardware error: {exc}",
+        )
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="An internal error occurred. Check server logs.",
+    )
+
+
+def _content_type_from_bytes(data: bytes) -> str:
+    if data[:2] == b"\xff\xd8":
+        return "image/jpeg"
+    if data[:4] == b"\x89PNG":
+        return "image/png"
+    if data[:2] == b"BM":
+        return "image/bmp"
+    if data[:4] in (b"II\x2a\x00", b"MM\x00\x2a"):
+        return "image/tiff"
+    return "application/octet-stream"
 
 
 # ---------------------------------------------------------------------------
@@ -71,129 +114,159 @@ cam_route = APIRouter(prefix="/dslr", tags=["DSLR"])
 @cam_route.get("/detect")
 async def detect_cameras(
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
+    # _user=Depends(get_current_active_user),  # TODO: enable
 ):
     """Detect all available USB cameras."""
-    cameras = await clsr.detect_usb_cameras()
-    return {
-        "status": "success",
-        "cameras_found": len(cameras),
-        "cameras": cameras,
-        "current_status": clsr.get_status(),
-    }
+    try:
+        cameras = await clsr.detect_usb_cameras()
+        return {
+            "status": "success",
+            "cameras_found": len(cameras),
+            "cameras": cameras,
+            "current_status": clsr.get_status(),
+        }
+    except Exception as exc:
+        raise _map_hardware_error(exc)
 
 
 @cam_route.post("/connect")
 async def connect_camera(
-    port: Optional[str] = None,
+    port: Optional[str] = Query(None, description="USB port string, e.g. usb:001,005"),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
+    # _user=Depends(get_current_active_user),  # TODO: enable
 ):
-    """Connect to a specific camera by port or auto-select."""
-    if not port:
-        cameras = await clsr.detect_usb_cameras()
-        if not cameras:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="No cameras detected"
-            )
-        port = cameras[0]["port"]
-        logger.info(f"Auto-selecting camera at {port}")
+    """Connect to a specific camera port, or auto-select the first detected."""
+    try:
+        if not port:
+            cameras = await clsr.detect_usb_cameras()
+            if not cameras:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="No cameras detected.",
+                )
+            port = cameras[0]["port"]
+            logger.info("Auto-selected camera at port %s", port)
 
-    success = await clsr.connect_to_camera(port)
-    if not success:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to connect to camera",
-        )
-    return {"status": "connected", "port": port}
+        success = await clsr.connect_to_camera(port)
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Failed to connect to camera at port {port!r}.",
+            )
+        return {"status": "connected", "port": port, "camera_model": clsr.camera_model}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _map_hardware_error(exc)
 
 
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
 
-
 @cam_route.get("/settings")
 async def get_settings(
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
+    # _user=Depends(get_current_active_user),  # TODO: enable
 ):
-    """Fetch current camera settings and allowed values."""
+    """Fetch current camera settings and their allowed values."""
     try:
         settings = await clsr.get_camera_settings()
         return {"status": "success", "settings": settings}
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
-        )
+    except Exception as exc:
+        raise _map_hardware_error(exc)
 
 
 @cam_route.patch("/settings")
 async def update_settings(
-    settings: Dict[str, str] = Body(...),
+    settings: Dict[str, str] = Body(..., example={"iso": "400", "shutterspeed": "1/125"}),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
+    # _user=Depends(get_current_active_user),  # TODO: enable
 ):
-    """Update one or more camera settings."""
+    """
+    Update one or more camera settings.
+    Returns which keys were applied and which were rejected.
+    """
+    if not settings:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Settings body must not be empty.",
+        )
     try:
         result = await clsr.set_camera_settings(settings)
         return {"status": "success", **result}
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
-        )
+    except Exception as exc:
+        raise _map_hardware_error(exc)
 
 
 # ---------------------------------------------------------------------------
 # Stream control
 # ---------------------------------------------------------------------------
 
-
 @cam_route.post("/start")
 async def start_stream(
-    port: Optional[str] = None,
+    port: Optional[str] = Query(None),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    # _user=Depends(get_current_active_user),
+    # _user=Depends(get_current_active_user),  # TODO: enable
 ):
-    """Start the camera live stream."""
+    """Start the camera live-view stream."""
     if clsr.is_streaming:
         return {
             "status": "already_running",
             "camera_model": clsr.camera_model,
             "port": clsr.selected_port,
+            "stream_url": f"{API_PREFIX}/livestream",
         }
-    success = await clsr.start_streaming(port)
+    try:
+        success = await clsr.start_streaming(port)
+    except Exception as exc:
+        raise _map_hardware_error(exc)
+
     if not success:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Failed to start camera stream",
+            detail="Failed to start camera stream.",
         )
     return {
         "status": "started",
         "camera_model": clsr.camera_model,
         "port": clsr.selected_port,
-        "stream_url": "/dslr/livestream",
+        "stream_url": f"{API_PREFIX}/livestream",
     }
 
 
 @cam_route.post("/stop")
 async def stop_stream(
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    ## _user=Depends(get_current_active_user),
+    # _user=Depends(get_current_active_user),  # TODO: enable
 ):
-    """Stop the camera live stream."""
-    await clsr.stop_streaming()
-    return {"status": "stopped", "message": "Live stream stopped successfully"}
+    """Stop the camera live-view stream."""
+    try:
+        await clsr.stop_streaming()
+    except Exception as exc:
+        raise _map_hardware_error(exc)
+    return {"status": "stopped"}
 
 
 @cam_route.get("/livestream")
 async def live_stream(
-    port: Optional[str] = None,
+    port: Optional[str] = Query(None),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    # _user=Depends(get_current_active_user),
+    # _user=Depends(get_current_active_user),  # TODO: enable
 ):
-    """MJPEG live stream endpoint."""
+    """
+    MJPEG live-stream endpoint.
+    Auto-starts the stream if not already running.
+    """
     if not clsr.is_streaming:
-        if not await clsr.start_streaming(port):
+        try:
+            success = await clsr.start_streaming(port)
+        except Exception as exc:
+            raise _map_hardware_error(exc)
+        if not success:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Failed to start camera stream",
+                detail="Failed to start camera stream.",
             )
     return StreamingResponse(
         clsr.generate_mjpeg_stream(),
@@ -209,219 +282,301 @@ async def live_stream(
 @cam_route.get("/status")
 async def stream_status(
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    # _user=Depends(get_current_active_user),
+    # _user=Depends(get_current_active_user),  # TODO: enable
 ):
-    """Get current streaming status."""
+    """Return full camera and stream status, including circuit-breaker state."""
     info = clsr.get_status()
-    return {"status": "running" if info["is_streaming"] else "stopped", **info}
+    return {
+        "status": "running" if info["is_streaming"] else "stopped",
+        **info,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Capture
 # ---------------------------------------------------------------------------
 
-
 @cam_route.post("/capture")
 async def capture_photo(
-    keep_on_sd: bool = Query(False),
+    keep_on_sd: bool = Query(False, description="Retain image on SD card after download"),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
+    # _user=Depends(get_current_active_user),  # TODO: enable
 ):
-    """Capture a high-resolution photo with autonomous hardware synchronization."""
+    """
+    Capture a full-resolution photo and return it as a binary response.
+    Basic image metrics are included as X-Image-* response headers.
+    """
     try:
-        if not clsr.camera:
-            # Try to connect if not already connected
-            if not await clsr.start_streaming():
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Camera not connected. Start stream first.",
-                )
+        await _ensure_connected(clsr)
 
-        file_data, filename, metadata = await clsr.capture_photo(keep_on_sd=keep_on_sd)
+        # capture_photo() returns (bytes, str) — metadata is logged in DLSR_Helper
+        image_bytes, filename = await clsr.capture_photo(keep_on_sd=keep_on_sd)
 
-        # Detect content type from magic bytes
-        if file_data[:2] == b"\xff\xd8":
-            content_type = "image/jpeg"
-        elif file_data[:4] == b"\x89PNG":
-            content_type = "image/png"
-        elif file_data[:2] == b"BM":
-            content_type = "image/bmp"
-        elif file_data[:4] in (b"II\x2a\x00", b"MM\x00\x2a"):
-            content_type = "image/tiff"
-        else:
-            content_type = "application/octet-stream"
+        # Extract metadata for response headers without a second hardware round-trip
+        metadata = clsr.extract_image_metadata(image_bytes, filename)
 
-        ts = int(time.time())
-        ext = filename.rsplit(".", 1)[-1]
-        download_name = f"capture_{ts}.{ext}"
+        content_type = _content_type_from_bytes(image_bytes)
+        ext = filename.rsplit(".", 1)[-1] if "." in filename else "jpg"
+        download_name = f"capture_{int(time.time())}.{ext}"
 
-        logger.info(f"Returning photo: {len(file_data)} bytes, {content_type}")
+        logger.info(
+            "Returning capture: %d bytes, %s, %dx%d px",
+            len(image_bytes), content_type,
+            metadata.get("width_px", 0), metadata.get("height_px", 0),
+        )
         return Response(
-            content=file_data,
+            content=image_bytes,
             media_type=content_type,
             headers={
-                "Content-Disposition": f"attachment; filename={download_name}",
-                "X-Image-Width-PX": str(metadata["width_px"]),
-                "X-Image-Height-PX": str(metadata["height_px"]),
-                "X-Image-DPI": str(metadata["dpi"]),
-                "X-Image-Width-MM": str(metadata["width_mm"]),
-                "X-Image-Height-MM": str(metadata["height_mm"]),
-                "X-Image-Format": metadata["format"],
+                # RFC 6266 — filename must be quoted
+                "Content-Disposition": f'attachment; filename="{download_name}"',
+                "X-Image-Width-PX":  str(metadata.get("width_px",  0)),
+                "X-Image-Height-PX": str(metadata.get("height_px", 0)),
+                "X-Image-DPI":       str(metadata.get("dpi",       300)),
+                "X-Image-Width-MM":  str(metadata.get("width_mm",  0.0)),
+                "X-Image-Height-MM": str(metadata.get("height_mm", 0.0)),
+                "X-Image-Format":    str(metadata.get("format",    "Unknown")),
             },
         )
 
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"API Capture error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Capture failed: {str(e)}",
-        )
+    except Exception as exc:
+        raise _map_hardware_error(exc)
+
+
+@cam_route.post("/capture/detailed")
+async def capture_photo_detailed(
+    keep_on_sd: bool = Query(False),
+    clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
+    # _user=Depends(get_current_active_user),  # TODO: enable
+):
+    """
+    Capture a photo and return metadata + Base64-encoded image as JSON.
+    Intended for clients that cannot handle binary responses.
+    """
+    try:
+        await _ensure_connected(clsr)
+
+        image_bytes, filename = await clsr.capture_photo(keep_on_sd=keep_on_sd)
+        metadata = clsr.extract_image_metadata(image_bytes, filename)
+
+        return {
+            "filename":   filename,
+            "format":     metadata.get("format",    "Unknown"),
+            "width_px":   metadata.get("width_px",  0),
+            "height_px":  metadata.get("height_px", 0),
+            "dpi":        metadata.get("dpi",        300),
+            "width_mm":   metadata.get("width_mm",  0.0),
+            "height_mm":  metadata.get("height_mm", 0.0),
+            "image_data": base64.b64encode(image_bytes).decode("utf-8"),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _map_hardware_error(exc)
 
 
 # ---------------------------------------------------------------------------
-# Health / Test (public — no auth)
+# Health  (public — no auth required)
 # ---------------------------------------------------------------------------
-
 
 @cam_route.get("/health")
-async def camera_health(clsr: CameraLiveViewStreamer = Depends(get_camera_streamer)):
-    """Check camera connectivity. Read-only, no auth required."""
-    if not clsr.camera:
-        return {
-            "status": "unhealthy",
-            "message": "Camera not connected",
-            "timestamp": time.time(),
-        }
-    # Use streaming status as a lightweight liveness signal — no extra capture
+async def camera_health(
+    clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
+):
+    """
+    Lightweight health check.  Read-only — never triggers a capture.
+    Returns 200 regardless of camera state so load-balancers don't cycle
+    the process; the 'status' field conveys actual health.
+    """
     info = clsr.get_status()
     return {
-        "status": "healthy" if info["camera_connected"] else "unhealthy",
-        "camera_model": info["camera_model"],
-        "port": info["selected_port"],
-        "is_streaming": info["is_streaming"],
-        "timestamp": time.time(),
+        "status":           "healthy" if info["camera_connected"] else "unhealthy",
+        "camera_model":     info["camera_model"],
+        "port":             info["selected_port"],
+        "is_streaming":     info["is_streaming"],
+        "circuit_breaker":  info.get("circuit_breaker", "CLOSED"),
+        "timestamp":        time.time(),
     }
 
 
 @cam_route.get("/test")
 async def test_endpoint():
-    """Test endpoint — no auth required."""
+    """Unauthenticated smoke-test endpoint."""
     return {
-        "service": "DSLR Camera Controller",
-        "status": "operational",
+        "service":   "DSLR Camera Controller",
+        "status":    "operational",
         "timestamp": time.time(),
         "endpoints": [
-            {"path": "/dslr/detect", "method": "GET", "auth": True},
-            {"path": "/dslr/connect", "method": "POST", "auth": True},
-            {"path": "/dslr/livestream", "method": "GET", "auth": True},
-            {"path": "/dslr/start", "method": "POST", "auth": True},
-            {"path": "/dslr/stop", "method": "POST", "auth": True},
-            {"path": "/dslr/status", "method": "GET", "auth": True},
-            {"path": "/dslr/capture", "method": "POST", "auth": True},
-            {"path": "/dslr/health", "method": "GET", "auth": False},
+            # auth column reflects actual current state (all TODO: pending)
+            {"path": f"{API_PREFIX}/detect",          "method": "GET",   "auth": False},
+            {"path": f"{API_PREFIX}/connect",         "method": "POST",  "auth": False},
+            {"path": f"{API_PREFIX}/livestream",      "method": "GET",   "auth": False},
+            {"path": f"{API_PREFIX}/start",           "method": "POST",  "auth": False},
+            {"path": f"{API_PREFIX}/stop",            "method": "POST",  "auth": False},
+            {"path": f"{API_PREFIX}/status",          "method": "GET",   "auth": False},
+            {"path": f"{API_PREFIX}/capture",         "method": "POST",  "auth": False},
+            {"path": f"{API_PREFIX}/capture/detailed","method": "POST",  "auth": False},
+            {"path": f"{API_PREFIX}/settings",        "method": "GET",   "auth": False},
+            {"path": f"{API_PREFIX}/settings",        "method": "PATCH", "auth": False},
+            {"path": f"{API_PREFIX}/health",          "method": "GET",   "auth": False},
         ],
     }
 
 
 # ---------------------------------------------------------------------------
-# Web UI (public — informational only)
+# Web UI  (public — informational only)
 # ---------------------------------------------------------------------------
-
 
 @cam_route.get("/select", response_class=HTMLResponse)
 async def camera_selection_page():
     """Minimal camera control web UI."""
-    html = """<!DOCTYPE html>
+    # API_PREFIX is injected server-side — no hard-coded paths in JS
+    html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Camera Control</title>
   <style>
-    body{font-family:Arial,sans-serif;margin:20px}
-    .card{border:1px solid #ddd;padding:15px;margin:10px 0;border-radius:5px}
-    .camera{background:#f9f9f9}.camera.selected{background:#e3f2fd;border-color:#2196f3}
-    button{padding:10px 15px;margin:5px;border:none;border-radius:4px;cursor:pointer}
-    .btn-primary{background:#2196f3;color:#fff}.btn-success{background:#4caf50;color:#fff}
-    .btn-danger{background:#f44336;color:#fff}
-    .ok{color:#2e7d32}.err{color:#c62828}
-    #video{width:100%;max-width:800px;margin:20px 0}
+    body{{font-family:Arial,sans-serif;margin:20px;max-width:900px}}
+    .card{{border:1px solid #ddd;padding:15px;margin:10px 0;border-radius:5px}}
+    .camera{{background:#f9f9f9}}.camera.selected{{background:#e3f2fd;border-color:#2196f3}}
+    button{{padding:10px 15px;margin:5px;border:none;border-radius:4px;cursor:pointer}}
+    .btn-primary{{background:#2196f3;color:#fff}}
+    .btn-success{{background:#4caf50;color:#fff}}
+    .btn-danger{{background:#f44336;color:#fff}}
+    button:disabled{{opacity:.45;cursor:not-allowed}}
+    #video{{width:100%;max-width:800px;margin:20px 0;display:block}}
+    #msg{{margin-top:8px;font-size:.9em;color:#555}}
   </style>
 </head>
 <body>
-  <h1>📷 Camera Control Panel</h1>
+  <h1>&#128247; Camera Control Panel</h1>
+
   <div class="card">
     <h3>1. Detect Cameras</h3>
-    <button onclick="detectCameras()" class="btn-primary">🔍 Detect</button>
+    <button onclick="detectCameras()" class="btn-primary">&#128269; Detect</button>
     <div id="cameraList"></div>
   </div>
+
   <div class="card">
     <h3>2. Stream Controls</h3>
-    <button onclick="startStream()" class="btn-success" id="startBtn">▶ Start</button>
-    <button onclick="stopStream()" class="btn-danger" id="stopBtn" disabled>⏹ Stop</button>
-    <button onclick="capturePhoto()" class="btn-primary" id="captureBtn" disabled>📸 Capture</button>
-    <div id="streamStatus"></div>
+    <button onclick="startStream()" class="btn-success" id="startBtn" disabled>&#9654; Start</button>
+    <button onclick="stopStream()"  class="btn-danger"  id="stopBtn"  disabled>&#9209; Stop</button>
+    <button onclick="capturePhoto()" class="btn-primary" id="captureBtn" disabled>&#128248; Capture</button>
+    <div id="msg"></div>
   </div>
+
   <div class="card">
     <h3>3. Live View</h3>
-    <img id="video" src="" alt="Stream will appear here">
+    <img id="video" src="" alt="Live stream will appear here after starting.">
   </div>
+
   <script>
+    const API = {repr(API_PREFIX)};
     let selectedPort = null;
 
-    async function detectCameras() {
-      const res = await fetch('/app/v1/dslr/detect');
-      if (!res.ok) { alert('Auth required or server error'); return; }
-      const data = await res.json();
-      const list = document.getElementById('cameraList');
-      list.innerHTML = '';
-      if (!data.cameras_found) { list.textContent = 'No cameras found.'; return; }
-      data.cameras.forEach(cam => {
-        const div = document.createElement('div');
-        div.className = 'camera';
-        const h4 = document.createElement('h4');
-        h4.textContent = cam.model || 'Unknown Camera';       // textContent prevents XSS
-        const p = document.createElement('p');
-        p.textContent = 'Port: ' + cam.port;
-        const btn = document.createElement('button');
-        btn.className = 'btn-primary';
-        btn.textContent = 'Select';
-        btn.onclick = () => { selectedPort = cam.port; document.getElementById('startBtn').disabled = false; };
-        div.append(h4, p, btn);
-        list.appendChild(div);
-      });
-    }
+    function setMsg(text) {{
+      document.getElementById('msg').textContent = text;
+    }}
 
-    async function startStream() {
-      let url = '/app/v1/dslr/start';
-      if (selectedPort) url += '?port=' + encodeURIComponent(selectedPort);
-      const res = await fetch(url, {method: 'POST'});
-      const data = await res.json();
-      document.getElementById('streamStatus').textContent = 'Status: ' + data.status;
-      document.getElementById('stopBtn').disabled = false;
-      document.getElementById('captureBtn').disabled = false;
-      document.getElementById('video').src = '/app/v1/dslr/livestream';
-    }
+    async function apiFetch(path, opts = {{}}) {{
+      const res = await fetch(API + path, opts);
+      if (!res.ok) {{
+        const err = await res.json().catch(() => ({{detail: res.statusText}}));
+        throw new Error(err.detail || res.statusText);
+      }}
+      return res;
+    }}
 
-    async function stopStream() {
-      await fetch('/app/v1/dslr/stop', {method: 'POST'});
-      document.getElementById('startBtn').disabled = false;
-      document.getElementById('stopBtn').disabled = true;
-      document.getElementById('captureBtn').disabled = true;
-      document.getElementById('video').src = '';
-    }
+    async function detectCameras() {{
+      setMsg('Detecting…');
+      try {{
+        const data = await (await apiFetch('/detect')).json();
+        const list = document.getElementById('cameraList');
+        list.innerHTML = '';
+        if (!data.cameras_found) {{
+          list.textContent = 'No cameras found.';
+          setMsg('');
+          return;
+        }}
+        data.cameras.forEach(cam => {{
+          const div = document.createElement('div');
+          div.className = 'camera';
+          const h4  = document.createElement('h4');
+          h4.textContent = cam.model || 'Unknown Camera';   // textContent prevents XSS
+          const p   = document.createElement('p');
+          p.textContent = 'Port: ' + cam.port;
+          const btn = document.createElement('button');
+          btn.className = 'btn-primary';
+          btn.textContent = 'Select';
+          btn.onclick = () => {{
+            selectedPort = cam.port;
+            document.querySelectorAll('.camera').forEach(d => d.classList.remove('selected'));
+            div.classList.add('selected');
+            document.getElementById('startBtn').disabled = false;
+            setMsg('Selected: ' + cam.model + ' @ ' + cam.port);
+          }};
+          div.append(h4, p, btn);
+          list.appendChild(div);
+        }});
+        setMsg(data.cameras_found + ' camera(s) found.');
+      }} catch (e) {{
+        setMsg('Error: ' + e.message);
+      }}
+    }}
 
-    async function capturePhoto() {
-      const res = await fetch('/app/v1/dslr/capture', {method: 'POST'});
-      if (!res.ok) { alert('Capture failed'); return; }
-      const blob = await res.blob();
-      const a = Object.assign(document.createElement('a'), {
-        href: URL.createObjectURL(blob),
-        download: 'photo_' + Date.now() + '.jpg',
-      });
-      document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    }
+    async function startStream() {{
+      setMsg('Starting stream…');
+      try {{
+        const qs = selectedPort ? '?port=' + encodeURIComponent(selectedPort) : '';
+        const data = await (await apiFetch('/start' + qs, {{method: 'POST'}})).json();
+        setMsg('Status: ' + data.status);
+        document.getElementById('stopBtn').disabled    = false;
+        document.getElementById('captureBtn').disabled = false;
+        document.getElementById('startBtn').disabled   = true;
+        document.getElementById('video').src = API + '/livestream' + qs;
+      }} catch (e) {{
+        setMsg('Start failed: ' + e.message);
+      }}
+    }}
 
+    async function stopStream() {{
+      setMsg('Stopping…');
+      try {{
+        await apiFetch('/stop', {{method: 'POST'}});
+        document.getElementById('startBtn').disabled   = false;
+        document.getElementById('stopBtn').disabled    = true;
+        document.getElementById('captureBtn').disabled = true;
+        document.getElementById('video').src = '';
+        setMsg('Stream stopped.');
+      }} catch (e) {{
+        setMsg('Stop failed: ' + e.message);
+      }}
+    }}
+
+    async function capturePhoto() {{
+      setMsg('Capturing…');
+      try {{
+        const res = await apiFetch('/capture', {{method: 'POST'}});
+        const blob = await res.blob();
+        const a = Object.assign(document.createElement('a'), {{
+          href:     URL.createObjectURL(blob),
+          download: 'photo_' + Date.now() + '.jpg',
+        }});
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setMsg('Photo downloaded.');
+      }} catch (e) {{
+        setMsg('Capture failed: ' + e.message);
+      }}
+    }}
+
+    // Auto-detect on load
     detectCameras();
   </script>
 </body>

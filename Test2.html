@@ -1,0 +1,1345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DSLR Ground Control</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg:       #0a0a0b;
+  --surface:  #111113;
+  --surface2: #1a1a1d;
+  --border:   #2a2a2e;
+  --amber:    #f59e0b;
+  --amber-dim:#78490a;
+  --cyan:     #22d3ee;
+  --red:      #ef4444;
+  --green:    #22c55e;
+  --text:     #e8e8e8;
+  --muted:    #555560;
+  --mono:     'Space Mono', monospace;
+  --sans:     'Syne', sans-serif;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  overflow: hidden;
+}
+
+/* ── SCANLINE OVERLAY ── */
+body::before {
+  content: '';
+  position: fixed; inset: 0;
+  background: repeating-linear-gradient(
+    0deg, transparent, transparent 2px,
+    rgba(0,0,0,0.06) 2px, rgba(0,0,0,0.06) 4px
+  );
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* ── LAYOUT ── */
+.shell {
+  display: grid;
+  grid-template-rows: 48px 1fr;
+  grid-template-columns: 56px 1fr 300px;
+  height: 100vh;
+  gap: 0;
+}
+
+/* ── TOPBAR ── */
+.topbar {
+  grid-column: 1 / -1;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  gap: 20px;
+}
+.topbar-brand {
+  font-family: var(--sans);
+  font-weight: 800;
+  font-size: 0.95rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--amber);
+}
+.topbar-sep { flex: 1; }
+.topbar-item {
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.topbar-item span { color: var(--text); }
+#globalStatus {
+  padding: 3px 10px;
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  background: rgba(239,68,68,0.15);
+  color: var(--red);
+  border: 1px solid rgba(239,68,68,0.3);
+  transition: all 0.3s;
+}
+#globalStatus.online {
+  background: rgba(34,197,94,0.15);
+  color: var(--green);
+  border-color: rgba(34,197,94,0.3);
+}
+#globalStatus.streaming {
+  background: rgba(245,158,11,0.15);
+  color: var(--amber);
+  border-color: rgba(245,158,11,0.3);
+}
+#cbStatus {
+  padding: 3px 10px;
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  background: rgba(34,197,94,0.1);
+  color: var(--green);
+  border: 1px solid rgba(34,197,94,0.2);
+}
+#cbStatus.open {
+  background: rgba(239,68,68,0.2);
+  color: var(--red);
+  border-color: rgba(239,68,68,0.4);
+}
+
+/* ── SIDE NAV ── */
+.sidenav {
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 12px 0;
+  gap: 4px;
+}
+.nav-btn {
+  width: 36px; height: 36px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.15s;
+  font-size: 14px;
+}
+.nav-btn:hover { background: var(--surface2); color: var(--text); }
+.nav-btn.active { background: rgba(245,158,11,0.15); color: var(--amber); }
+.nav-divider { width: 24px; height: 1px; background: var(--border); margin: 4px 0; }
+
+/* ── MAIN AREA ── */
+.main {
+  display: grid;
+  grid-template-rows: 1fr 160px;
+  overflow: hidden;
+}
+
+/* ── VIEWPORT ── */
+.viewport-wrap {
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  overflow: hidden;
+}
+#cameraStream {
+  max-width: 100%; max-height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.vp-hud {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+/* Corner brackets */
+.vp-hud::before, .vp-hud::after {
+  content: '';
+  position: absolute;
+  width: 32px; height: 32px;
+  border-color: var(--amber);
+  border-style: solid;
+  opacity: 0.5;
+}
+.vp-hud::before { top: 16px; left: 16px; border-width: 2px 0 0 2px; }
+.vp-hud::after  { bottom: 16px; right: 16px; border-width: 0 2px 2px 0; }
+
+.hud-tl, .hud-tr, .hud-bl {
+  position: absolute;
+  font-family: var(--mono);
+  font-size: 0.6rem;
+  color: var(--amber);
+  opacity: 0.7;
+  background: rgba(0,0,0,0.5);
+  padding: 3px 6px;
+  border-radius: 3px;
+}
+.hud-tl { top: 16px; left: 54px; }
+.hud-tr { top: 16px; right: 16px; display: flex; gap: 8px; }
+.hud-bl { bottom: 16px; left: 16px; }
+.live-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--red);
+  box-shadow: 0 0 8px var(--red);
+  animation: blink 1.2s ease-in-out infinite;
+  display: inline-block;
+  align-self: center;
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+.vp-offline-msg {
+  position: absolute;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  color: var(--muted);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-align: center;
+}
+
+/* ── CONSOLE STRIP ── */
+.console-strip {
+  border-top: 1px solid var(--border);
+  background: #060608;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.console-header {
+  padding: 6px 14px;
+  font-family: var(--mono);
+  font-size: 0.6rem;
+  color: var(--muted);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+}
+#console {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 14px;
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  line-height: 1.6;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+.log-info  { color: #6b7280; }
+.log-ok    { color: var(--green); }
+.log-warn  { color: var(--amber); }
+.log-error { color: var(--red); }
+.log-cmd   { color: var(--cyan); }
+
+/* ── RIGHT PANEL ── */
+.panel {
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.panel-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.tab-btn {
+  flex: 1;
+  padding: 10px 4px;
+  font-family: var(--mono);
+  font-size: 0.6rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: all 0.15s;
+}
+.tab-btn.active { color: var(--amber); border-bottom-color: var(--amber); }
+
+.tab-content { display: none; flex: 1; overflow-y: auto; flex-direction: column; }
+.tab-content.active { display: flex; }
+
+/* ── CONTROL TAB ── */
+.ctrl-section {
+  padding: 14px;
+  border-bottom: 1px solid var(--border);
+}
+.ctrl-section-label {
+  font-family: var(--mono);
+  font-size: 0.6rem;
+  color: var(--muted);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+}
+.url-input {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 7px 10px;
+  border-radius: 5px;
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  transition: border-color 0.15s;
+}
+.url-input:focus { outline: none; border-color: var(--amber); }
+
+.btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.ctrl-btn {
+  flex: 1;
+  min-width: 80px;
+  padding: 9px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  cursor: pointer;
+  background: var(--surface2);
+  color: var(--text);
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.ctrl-btn:hover { border-color: var(--amber); color: var(--amber); }
+.ctrl-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+.ctrl-btn.primary  { background: var(--amber); color: #000; border-color: var(--amber); font-weight: 700; }
+.ctrl-btn.primary:hover { background: #fbbf24; }
+.ctrl-btn.danger   { background: rgba(239,68,68,0.1); color: var(--red); border-color: rgba(239,68,68,0.3); }
+.ctrl-btn.danger:hover { background: rgba(239,68,68,0.2); }
+.ctrl-btn.success  { background: rgba(34,197,94,0.1); color: var(--green); border-color: rgba(34,197,94,0.3); }
+
+.stat-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 7px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+  font-size: 0.75rem;
+}
+.stat-row:last-child { border-bottom: none; }
+.stat-key { color: var(--muted); font-family: var(--mono); font-size: 0.62rem; }
+.stat-val { color: var(--text); font-family: var(--mono); font-size: 0.72rem; font-weight: 700; }
+.stat-val.green { color: var(--green); }
+.stat-val.red   { color: var(--red); }
+.stat-val.amber { color: var(--amber); }
+
+/* ── SETTINGS TAB ── */
+.settings-body {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.setting-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  align-items: center;
+}
+.setting-label {
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.setting-select, .setting-input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 8px;
+  border-radius: 5px;
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  width: 100%;
+  transition: border-color 0.15s;
+}
+.setting-select:focus, .setting-input:focus {
+  outline: none; border-color: var(--amber);
+}
+.setting-select option { background: #111; }
+.settings-actions {
+  padding: 12px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* ── SD CARD TAB ── */
+.sd-toolbar {
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.path-bar {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 10px;
+  border-radius: 5px;
+  font-family: var(--mono);
+  font-size: 0.65rem;
+}
+.path-bar:focus { outline: none; border-color: var(--amber); }
+.sd-list { flex: 1; overflow-y: auto; }
+.sd-item {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(255,255,255,0.03);
+  gap: 10px;
+  cursor: pointer;
+  transition: background 0.1s;
+  font-family: var(--mono);
+  font-size: 0.65rem;
+}
+.sd-item:hover { background: var(--surface2); }
+.sd-item-icon { color: var(--muted); width: 14px; text-align: center; }
+.sd-item-name { flex: 1; color: var(--text); }
+.sd-item-size { color: var(--muted); font-size: 0.6rem; }
+.sd-item-dl {
+  padding: 3px 7px;
+  border-radius: 4px;
+  font-size: 0.6rem;
+  background: rgba(34,197,94,0.1);
+  color: var(--green);
+  border: 1px solid rgba(34,197,94,0.2);
+  cursor: pointer;
+  font-family: var(--mono);
+}
+.sd-item-dl:hover { background: rgba(34,197,94,0.2); }
+.sd-empty {
+  padding: 24px;
+  text-align: center;
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  color: var(--muted);
+}
+
+/* ── DETECT TAB ── */
+.detect-body { padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.cam-card {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+}
+.cam-card-model { font-weight: 700; font-size: 0.8rem; margin-bottom: 4px; }
+.cam-card-port { font-family: var(--mono); font-size: 0.65rem; color: var(--muted); margin-bottom: 10px; }
+
+/* ── HEALTH TAB ── */
+.health-body { padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.health-metric {
+  background: var(--surface2);
+  border-radius: 8px;
+  padding: 12px;
+  border: 1px solid var(--border);
+}
+.health-metric-label { font-family: var(--mono); font-size: 0.6rem; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.08em; }
+.health-metric-value { font-family: var(--mono); font-size: 1.1rem; font-weight: 700; }
+
+/* SHUTTER BUTTON — full-width at bottom of controls */
+.shutter-wrap { padding: 14px; border-top: 1px solid var(--border); }
+.shutter-btn {
+  width: 100%;
+  padding: 14px;
+  border-radius: 10px;
+  border: 2px solid var(--amber);
+  background: rgba(245,158,11,0.08);
+  color: var(--amber);
+  font-family: var(--sans);
+  font-size: 0.9rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.shutter-btn:hover:not(:disabled) { background: rgba(245,158,11,0.18); box-shadow: 0 0 24px rgba(245,158,11,0.2); }
+.shutter-btn:active:not(:disabled) { transform: scale(0.98); }
+.shutter-btn:disabled { opacity: 0.3; cursor: not-allowed; border-color: var(--border); color: var(--muted); }
+
+/* ── SCROLLBARS ── */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+/* ── LOADING SPINNER ── */
+.spinner {
+  width: 14px; height: 14px;
+  border: 2px solid var(--border);
+  border-top-color: var(--amber);
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+  display: inline-block;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── TOAST ── */
+.toast {
+  position: fixed;
+  bottom: 24px; left: 50%;
+  transform: translateX(-50%) translateY(60px);
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  padding: 10px 18px;
+  border-radius: 8px;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  color: var(--text);
+  opacity: 0;
+  transition: all 0.3s cubic-bezier(0.4,0,0.2,1);
+  z-index: 10000;
+  pointer-events: none;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.toast.ok    { border-color: rgba(34,197,94,0.4); color: var(--green); }
+.toast.err   { border-color: rgba(239,68,68,0.4); color: var(--red); }
+.toast.warn  { border-color: rgba(245,158,11,0.4); color: var(--amber); }
+
+/* ── URL INFO ── */
+.url-info {
+  margin-top: 6px;
+  font-family: var(--mono);
+  font-size: 0.55rem;
+  color: var(--muted);
+}
+.url-info span {
+  color: var(--amber);
+}
+</style>
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- ── TOPBAR ── -->
+  <header class="topbar">
+    <span class="topbar-brand">&#9632; Ground Control</span>
+    <div class="topbar-item">MODEL <span id="topModel">—</span></div>
+    <div class="topbar-item">PORT <span id="topPort">—</span></div>
+    <div class="topbar-item">FRAMES <span id="topFrames">0</span></div>
+    <div class="topbar-item">FPS <span id="topFps">0</span></div>
+    <div class="topbar-sep"></div>
+    <div id="cbStatus">CB: CLOSED</div>
+    &nbsp;
+    <div id="globalStatus">OFFLINE</div>
+  </header>
+
+  <!-- ── SIDE NAV ── -->
+  <nav class="sidenav">
+    <button class="nav-btn active" data-tab="control"  title="Control">⌁</button>
+    <button class="nav-btn"        data-tab="settings" title="Settings">⚙</button>
+    <button class="nav-btn"        data-tab="sd"       title="SD Card">▤</button>
+    <button class="nav-btn"        data-tab="detect"   title="Detect">⦿</button>
+    <div class="nav-divider"></div>
+    <button class="nav-btn"        data-tab="health"   title="Health">♥</button>
+  </nav>
+
+  <!-- ── MAIN ── -->
+  <main class="main">
+    <!-- VIEWPORT -->
+    <div class="viewport-wrap" id="viewportWrap">
+      <img id="cameraStream" src="" alt="" style="display:none;">
+      <div id="offlineMsg" class="vp-offline-msg">NO SIGNAL<br><span style="font-size:0.55rem;letter-spacing:0.2em;opacity:0.5">AWAITING STREAM INIT</span></div>
+      <div class="vp-hud">
+        <div class="hud-tl" id="hudBright">BRIG —</div>
+        <div class="hud-tr">
+          <span class="live-dot" id="liveDot" style="display:none;"></span>
+          <span id="hudFps">—</span> FPS
+        </div>
+        <div class="hud-bl" id="hudSettings">ISO — | f/— | 1/—s</div>
+      </div>
+    </div>
+
+    <!-- CONSOLE STRIP -->
+    <div class="console-strip">
+      <div class="console-header">
+        <span>SYS LOG</span>
+        <span id="logCount">0 entries</span>
+      </div>
+      <div id="console"></div>
+    </div>
+  </main>
+
+  <!-- ── RIGHT PANEL ── -->
+  <aside class="panel">
+    <div class="panel-tabs">
+      <button class="tab-btn active" data-tab="control">CTRL</button>
+      <button class="tab-btn"        data-tab="settings">SETTINGS</button>
+      <button class="tab-btn"        data-tab="sd">SD</button>
+      <button class="tab-btn"        data-tab="detect">DETECT</button>
+      <button class="tab-btn"        data-tab="health">HEALTH</button>
+    </div>
+
+    <!-- ══ CONTROL TAB ══ -->
+    <div class="tab-content active" id="tab-control">
+      <div class="ctrl-section">
+        <div class="ctrl-section-label">Base Station URL (DSLR)</div>
+        <input class="url-input" id="baseUrl" value="http://localhost:2000/app/v1/camera/dslr/" spellcheck="false">
+        <div class="url-info">SD Storage: <span id="sdUrlDisplay">http://localhost:2000/app/v1/camera_sd</span></div>
+      </div>
+
+      <div class="ctrl-section">
+        <div class="ctrl-section-label">Stream</div>
+        <div class="btn-row">
+          <button class="ctrl-btn primary" id="btnStart">▶ Start</button>
+          <button class="ctrl-btn danger"  id="btnStop"  disabled>■ Stop</button>
+        </div>
+      </div>
+
+      <div class="ctrl-section">
+        <div class="ctrl-section-label">Camera</div>
+        <div class="btn-row">
+          <button class="ctrl-btn" id="btnDetect">⦿ Detect</button>
+          <button class="ctrl-btn" id="btnConnect">⟳ Connect</button>
+          <button class="ctrl-btn" id="btnHealth">♥ Health</button>
+        </div>
+      </div>
+
+      <div class="ctrl-section">
+        <div class="ctrl-section-label">Live Status</div>
+        <div class="stat-row">
+          <span class="stat-key">streaming</span>
+          <span class="stat-val" id="stStreaming">—</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-key">connected</span>
+          <span class="stat-val" id="stConnected">—</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-key">subscribers</span>
+          <span class="stat-val" id="stSubs">—</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-key">frame count</span>
+          <span class="stat-val" id="stFrames">—</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-key">circuit breaker</span>
+          <span class="stat-val" id="stCb">—</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-key">errors</span>
+          <span class="stat-val" id="stErrors">—</span>
+        </div>
+      </div>
+
+      <div style="flex:1;"></div>
+
+      <div class="shutter-wrap">
+        <button class="shutter-btn" id="btnCapture" disabled>
+          ◎ &nbsp; SHUTTER RELEASE
+        </button>
+      </div>
+    </div>
+
+    <!-- ══ SETTINGS TAB ══ -->
+    <div class="tab-content" id="tab-settings">
+      <div style="padding:12px;border-bottom:1px solid var(--border);display:flex;gap:8px;flex-shrink:0;">
+        <button class="ctrl-btn" id="btnFetchSettings" style="flex:1;">⟳ Fetch from Camera</button>
+      </div>
+      <div class="settings-body" id="settingsBody">
+        <div class="sd-empty">Press "Fetch from Camera" to load live settings.</div>
+      </div>
+      <div class="settings-actions">
+        <button class="ctrl-btn success" id="btnApplySettings" style="flex:1;" disabled>✓ Apply Changes</button>
+        <button class="ctrl-btn" id="btnResetSettings" style="flex:1;" disabled>↺ Reset</button>
+      </div>
+    </div>
+
+    <!-- ══ SD CARD TAB ══ -->
+    <div class="tab-content" id="tab-sd">
+      <div class="sd-toolbar">
+        <input class="path-bar" id="sdPath" value="/" placeholder="Folder path…">
+        <button class="ctrl-btn" id="btnBrowse" style="flex:0;white-space:nowrap;">Browse</button>
+      </div>
+      <div class="ctrl-section" style="flex-shrink:0;">
+        <div class="btn-row">
+          <button class="ctrl-btn" id="btnSearchImages">⌕ Search Images</button>
+        </div>
+      </div>
+      <div class="sd-list" id="sdList">
+        <div class="sd-empty">Browse SD card or search for images.</div>
+      </div>
+    </div>
+
+    <!-- ══ DETECT TAB ══ -->
+    <div class="tab-content" id="tab-detect">
+      <div style="padding:12px;border-bottom:1px solid var(--border);flex-shrink:0;">
+        <button class="ctrl-btn primary" id="btnDetect2" style="width:100%;">⦿ Scan for USB Cameras</button>
+      </div>
+      <div class="detect-body" id="detectBody">
+        <div class="sd-empty">Run a scan to find connected cameras.</div>
+      </div>
+    </div>
+
+    <!-- ══ HEALTH TAB ══ -->
+    <div class="tab-content" id="tab-health">
+      <div style="padding:12px;border-bottom:1px solid var(--border);flex-shrink:0;">
+        <button class="ctrl-btn" id="btnRefreshHealth" style="width:100%;">⟳ Refresh Health</button>
+      </div>
+      <div class="health-body" id="healthBody">
+        <div class="sd-empty">Press refresh to poll /health endpoint.</div>
+      </div>
+    </div>
+
+  </aside>
+
+</div><!-- .shell -->
+
+<!-- TOAST -->
+<div class="toast" id="toast"></div>
+
+<script>
+// ═══════════════════════════════════════════════════════
+//  STATE
+// ═══════════════════════════════════════════════════════
+const state = {
+  streaming: false,
+  cameraSettings: {},    // raw settings from API
+  pendingChanges: {},    // staged but not applied
+  logCount: 0,
+  fpsTimes: [],
+  lastFrameTs: 0,
+  pollInterval: null,
+};
+
+// ═══════════════════════════════════════════════════════
+//  UTILS
+// ═══════════════════════════════════════════════════════
+function baseUrl() {
+  return document.getElementById('baseUrl').value.replace(/\/$/, '');
+}
+
+function sdBaseUrl() {
+  // Transform /app/v1/camera/dslr/ → /app/v1/camera_sd
+  return document.getElementById('baseUrl').value
+    .replace(/\/camera\/dslr\/?$/, '/camera_sd')
+    .replace(/\/$/, '');
+}
+
+function updateSdUrlDisplay() {
+  const el = document.getElementById('sdUrlDisplay');
+  if (el) el.textContent = sdBaseUrl();
+}
+
+let toastTimer;
+function toast(msg, type = 'info') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = `toast show ${type}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.className = 'toast', 2800);
+}
+
+let logEntries = 0;
+function log(msg, type = 'info') {
+  const el = document.getElementById('console');
+  const t  = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute:'2-digit', second:'2-digit' });
+  const div = document.createElement('div');
+  div.className = `log-${type}`;
+  div.textContent = `[${t}] ${msg}`;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+  logEntries++;
+  document.getElementById('logCount').textContent = `${logEntries} entries`;
+}
+
+async function api(path, opts = {}) {
+  const url = baseUrl() + path;
+  log(`→ ${opts.method || 'GET'} ${path}`, 'cmd');
+  const res = await fetch(url, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  });
+  if (!res.ok) {
+    let detail;
+    try { detail = (await res.json()).detail; } catch { detail = res.statusText; }
+    throw new Error(`HTTP ${res.status}: ${detail}`);
+  }
+  return res;
+}
+
+async function sdApi(path, opts = {}) {
+  const url = sdBaseUrl() + path;
+  log(`→ ${opts.method || 'GET'} ${path} (SD)`, 'cmd');
+  const res = await fetch(url, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  });
+  if (!res.ok) {
+    let detail;
+    try { detail = (await res.json()).detail; } catch { detail = res.statusText; }
+    throw new Error(`HTTP ${res.status}: ${detail}`);
+  }
+  return res;
+}
+
+// ═══════════════════════════════════════════════════════
+//  TAB ROUTING
+// ═══════════════════════════════════════════════════════
+function switchTab(name) {
+  document.querySelectorAll('.tab-btn, .nav-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.tab === name);
+  });
+  document.querySelectorAll('.tab-content').forEach(c => {
+    c.classList.toggle('active', c.id === `tab-${name}`);
+  });
+}
+
+document.querySelectorAll('.tab-btn, .nav-btn').forEach(b => {
+  b.addEventListener('click', () => switchTab(b.dataset.tab));
+});
+
+// ═══════════════════════════════════════════════════════
+//  STATUS POLLING
+// ═══════════════════════════════════════════════════════
+async function pollStatus() {
+  try {
+    const res  = await fetch(baseUrl() + '/status');
+    const data = await res.json();
+
+    // Topbar
+    document.getElementById('topModel').textContent  = data.camera_model || '—';
+    document.getElementById('topPort').textContent   = data.selected_port || '—';
+    document.getElementById('topFrames').textContent = data.frame_count   || 0;
+
+    // Status badge
+    const badge = document.getElementById('globalStatus');
+    if (data.is_streaming) {
+      badge.textContent = 'STREAMING';
+      badge.className = 'streaming';
+    } else if (data.camera_connected) {
+      badge.textContent = 'ONLINE';
+      badge.className = 'online';
+    } else {
+      badge.textContent = 'OFFLINE';
+      badge.className = '';
+    }
+
+    // CB badge
+    const cb = document.getElementById('cbStatus');
+    const cbOpen = data.circuit_breaker === 'OPEN';
+    cb.textContent = `CB: ${data.circuit_breaker || 'CLOSED'}`;
+    cb.className = cbOpen ? 'open' : '';
+
+    // Control tab stats
+    document.getElementById('stStreaming').textContent = data.is_streaming ? 'YES' : 'NO';
+    document.getElementById('stStreaming').className   = `stat-val ${data.is_streaming ? 'green' : 'red'}`;
+    document.getElementById('stConnected').textContent = data.camera_connected ? 'YES' : 'NO';
+    document.getElementById('stConnected').className   = `stat-val ${data.camera_connected ? 'green' : 'red'}`;
+    document.getElementById('stSubs').textContent   = data.subscribers       ?? '—';
+    document.getElementById('stFrames').textContent = data.frame_count        ?? '—';
+    document.getElementById('stCb').textContent     = data.circuit_breaker   || 'CLOSED';
+    document.getElementById('stCb').className       = `stat-val ${cbOpen ? 'red' : 'green'}`;
+    document.getElementById('stErrors').textContent = data.consecutive_errors ?? '—';
+    document.getElementById('stErrors').className   = `stat-val ${(data.consecutive_errors > 0) ? 'amber' : ''}`;
+
+    // HUD settings display from whatever we last fetched
+    if (state.cameraSettings.iso) {
+      const iso = state.cameraSettings.iso?.value || '—';
+      const apt = state.cameraSettings.aperture?.value || '—';
+      const ss  = state.cameraSettings.shutterspeed?.value || '—';
+      document.getElementById('hudSettings').textContent = `ISO ${iso} | f/${apt} | ${ss}s`;
+    }
+
+    // Auto-sync stream UI state
+    if (data.is_streaming && !state.streaming) {
+      activateStream();
+    } else if (!data.is_streaming && state.streaming) {
+      deactivateStream();
+    }
+  } catch { /* server not yet reachable — silent */ }
+}
+
+// ═══════════════════════════════════════════════════════
+//  STREAM MANAGEMENT
+// ═══════════════════════════════════════════════════════
+function activateStream() {
+  state.streaming = true;
+  const img = document.getElementById('cameraStream');
+  img.src = `${baseUrl()}/livestream?t=${Date.now()}`;
+  img.style.display = 'block';
+  document.getElementById('offlineMsg').style.display = 'none';
+  document.getElementById('liveDot').style.display = 'inline-block';
+  document.getElementById('btnStart').disabled = true;
+  document.getElementById('btnStop').disabled  = false;
+  document.getElementById('btnCapture').disabled = false;
+  startFps();
+}
+
+function deactivateStream() {
+  state.streaming = false;
+  const img = document.getElementById('cameraStream');
+  img.src = ''; img.style.display = 'none';
+  document.getElementById('offlineMsg').style.display = 'block';
+  document.getElementById('liveDot').style.display = 'none';
+  document.getElementById('btnStart').disabled = false;
+  document.getElementById('btnStop').disabled  = true;
+  document.getElementById('btnCapture').disabled = true;
+  document.getElementById('topFps').textContent = '0';
+  document.getElementById('hudFps').textContent = '—';
+  state.fpsTimes = [];
+}
+
+function startFps() {
+  const img = document.getElementById('cameraStream');
+  img.onload = () => {
+    const now = performance.now();
+    if (state.lastFrameTs) {
+      state.fpsTimes.push(now - state.lastFrameTs);
+      if (state.fpsTimes.length > 20) state.fpsTimes.shift();
+      const avg = state.fpsTimes.reduce((a, b) => a + b) / state.fpsTimes.length;
+      const fps = Math.round(1000 / avg);
+      document.getElementById('topFps').textContent = fps;
+      document.getElementById('hudFps').textContent = fps;
+    }
+    state.lastFrameTs = now;
+  };
+}
+
+// ═══════════════════════════════════════════════════════
+//  STREAM CONTROLS
+// ═══════════════════════════════════════════════════════
+document.getElementById('btnStart').addEventListener('click', async () => {
+  try {
+    const data = await (await api('/start', { method: 'POST' })).json();
+    log(`Stream started — ${data.camera_model || ''}`, 'ok');
+    activateStream();
+    toast('Stream started', 'ok');
+  } catch (e) {
+    log(`Start failed: ${e.message}`, 'error');
+    toast(e.message, 'err');
+  }
+});
+
+document.getElementById('btnStop').addEventListener('click', async () => {
+  try {
+    await api('/stop', { method: 'POST' });
+    log('Stream stopped.', 'warn');
+    deactivateStream();
+    toast('Stream stopped', 'warn');
+  } catch (e) {
+    log(`Stop failed: ${e.message}`, 'error');
+    toast(e.message, 'err');
+  }
+});
+
+// ═══════════════════════════════════════════════════════
+//  CAPTURE
+// ═══════════════════════════════════════════════════════
+document.getElementById('btnCapture').addEventListener('click', async () => {
+  const btn = document.getElementById('btnCapture');
+  btn.disabled = true;
+  btn.textContent = '◉  CAPTURING…';
+  log('Shutter fired — awaiting image data…', 'warn');
+  try {
+    const res = await api('/capture', { method: 'POST' });
+    // Read metadata headers
+    const w   = res.headers.get('X-Image-Width-PX')  || '?';
+    const h   = res.headers.get('X-Image-Height-PX') || '?';
+    const dpi = res.headers.get('X-Image-DPI')        || '?';
+    const fmt = res.headers.get('X-Image-Format')     || '?';
+    const blob = await res.blob();
+    const a = Object.assign(document.createElement('a'), {
+      href:     URL.createObjectURL(blob),
+      download: `DSLR_${Date.now()}.jpg`,
+    });
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    log(`Captured: ${fmt} ${w}×${h}px @ ${dpi}dpi — ${(blob.size/1024).toFixed(1)}KB`, 'ok');
+    toast(`Saved ${w}×${h} ${fmt}`, 'ok');
+  } catch (e) {
+    log(`Capture error: ${e.message}`, 'error');
+    toast(e.message, 'err');
+  } finally {
+    btn.disabled = !state.streaming;
+    btn.textContent = '◎  SHUTTER RELEASE';
+  }
+});
+
+// ═══════════════════════════════════════════════════════
+//  CONNECT / DETECT shortcuts
+// ═══════════════════════════════════════════════════════
+document.getElementById('btnDetect').addEventListener('click', async () => {
+  switchTab('detect');
+  document.getElementById('btnDetect2').click();
+});
+
+document.getElementById('btnConnect').addEventListener('click', async () => {
+  try {
+    const data = await (await api('/connect', { method: 'POST' })).json();
+    log(`Connected: ${data.camera_model} @ ${data.port}`, 'ok');
+    toast('Camera connected', 'ok');
+  } catch (e) {
+    log(`Connect error: ${e.message}`, 'error');
+    toast(e.message, 'err');
+  }
+});
+
+document.getElementById('btnHealth').addEventListener('click', async () => {
+  switchTab('health');
+  document.getElementById('btnRefreshHealth').click();
+});
+
+// ═══════════════════════════════════════════════════════
+//  SETTINGS TAB
+// ═══════════════════════════════════════════════════════
+
+// Settings we care about — maps API key → friendly label
+const SETTINGS_MAP = {
+  iso:                 'ISO',
+  shutterspeed:        'Shutter Speed',
+  aperture:            'Aperture',
+  whitebalance:        'White Balance',
+  exposurecompensation:'Exp. Comp.',
+  imageformat:         'Image Format',
+  imagequality:        'Quality',
+  colorspace:          'Color Space',
+  picturestyle:        'Picture Style',
+  drivemode:           'Drive Mode',
+};
+
+document.getElementById('btnFetchSettings').addEventListener('click', async () => {
+  const btn = document.getElementById('btnFetchSettings');
+  btn.textContent = '⟳ Fetching…';
+  btn.disabled = true;
+  try {
+    const data = await (await api('/settings')).json();
+    state.cameraSettings = data.settings;
+    state.pendingChanges  = {};
+    renderSettings(data.settings);
+    log('Settings loaded from camera hardware.', 'ok');
+    toast('Settings loaded', 'ok');
+    document.getElementById('btnApplySettings').disabled = true;
+    document.getElementById('btnResetSettings').disabled = false;
+  } catch (e) {
+    log(`Fetch settings error: ${e.message}`, 'error');
+    toast(e.message, 'err');
+  } finally {
+    btn.textContent = '⟳ Fetch from Camera';
+    btn.disabled = false;
+  }
+});
+
+function renderSettings(settings) {
+  const body = document.getElementById('settingsBody');
+  body.innerHTML = '';
+
+  for (const [key, label] of Object.entries(SETTINGS_MAP)) {
+    const s = settings[key];
+    if (!s) continue;
+
+    const row = document.createElement('div');
+    row.className = 'setting-row';
+
+    const lbl = document.createElement('div');
+    lbl.className = 'setting-label';
+    lbl.textContent = label;
+
+    let ctrl;
+    if (s.choices && s.choices.length > 0) {
+      ctrl = document.createElement('select');
+      ctrl.className = 'setting-select';
+      s.choices.forEach(c => {
+        const opt = document.createElement('option');
+        opt.value = c;
+        opt.textContent = c;
+        if (String(c) === String(s.value)) opt.selected = true;
+        ctrl.appendChild(opt);
+      });
+    } else {
+      ctrl = document.createElement('input');
+      ctrl.className = 'setting-input';
+      ctrl.type = 'text';
+      ctrl.value = s.value ?? '';
+    }
+
+    if (s.readonly) {
+      ctrl.disabled = true;
+      ctrl.title = 'Read-only on this camera';
+    }
+
+    ctrl.dataset.key = key;
+    ctrl.dataset.original = String(s.value ?? '');
+
+    ctrl.addEventListener('change', () => {
+      const changed = ctrl.value !== ctrl.dataset.original;
+      if (changed) {
+        state.pendingChanges[key] = ctrl.value;
+        ctrl.style.borderColor = 'var(--amber)';
+      } else {
+        delete state.pendingChanges[key];
+        ctrl.style.borderColor = '';
+      }
+      const hasPending = Object.keys(state.pendingChanges).length > 0;
+      document.getElementById('btnApplySettings').disabled = !hasPending;
+    });
+
+    row.append(lbl, ctrl);
+    body.appendChild(row);
+  }
+}
+
+document.getElementById('btnApplySettings').addEventListener('click', async () => {
+  if (!Object.keys(state.pendingChanges).length) return;
+  const btn = document.getElementById('btnApplySettings');
+  btn.textContent = '✓ Applying…'; btn.disabled = true;
+  log(`Applying ${Object.keys(state.pendingChanges).length} setting(s): ${Object.keys(state.pendingChanges).join(', ')}`, 'warn');
+  try {
+    const res  = await api('/settings', { method: 'PATCH', body: JSON.stringify(state.pendingChanges) });
+    const data = await res.json();
+    const applied = Object.keys(data.applied || {}).join(', ') || 'none';
+    const failed  = Object.keys(data.failed  || {}).join(', ') || 'none';
+    log(`Applied: [${applied}]  Rejected: [${failed}]`, failed === 'none' ? 'ok' : 'warn');
+    toast(failed === 'none' ? 'All settings applied' : `Some rejected: ${failed}`, failed === 'none' ? 'ok' : 'warn');
+    // Re-fetch to confirm actual hardware state
+    document.getElementById('btnFetchSettings').click();
+  } catch (e) {
+    log(`Apply settings error: ${e.message}`, 'error');
+    toast(e.message, 'err');
+    btn.textContent = '✓ Apply Changes';
+    btn.disabled = false;
+  }
+});
+
+document.getElementById('btnResetSettings').addEventListener('click', () => {
+  state.pendingChanges = {};
+  renderSettings(state.cameraSettings);
+  document.getElementById('btnApplySettings').disabled = true;
+  log('Settings reset to last fetched values.', 'info');
+  toast('Settings reset', 'warn');
+});
+
+// ═══════════════════════════════════════════════════════
+//  SD CARD TAB (Fixed for camera_sd router)
+// ═══════════════════════════════════════════════════════
+document.getElementById('btnBrowse').addEventListener('click', () => browseFolder());
+document.getElementById('sdPath').addEventListener('keydown', e => { if (e.key === 'Enter') browseFolder(); });
+
+async function browseFolder() {
+  const folder = encodeURIComponent(document.getElementById('sdPath').value || '/');
+  const list   = document.getElementById('sdList');
+  list.innerHTML = '<div class="sd-empty"><span class="spinner"></span> Loading…</div>';
+  try {
+    const data = await (await sdApi(`/sd/list?folder=${folder}`)).json();
+    renderSdList(data.contents || data);
+    log(`SD listed: ${(data.contents || data).length} items in ${decodeURIComponent(folder)}`, 'ok');
+  } catch (e) {
+    list.innerHTML = `<div class="sd-empty" style="color:var(--red)">Error: ${e.message}</div>`;
+    log(`SD list error: ${e.message}`, 'error');
+  }
+}
+
+document.getElementById('btnSearchImages').addEventListener('click', async () => {
+  const list = document.getElementById('sdList');
+  list.innerHTML = '<div class="sd-empty"><span class="spinner"></span> Searching…</div>';
+  try {
+    const data = await (await sdApi('/sd/search')).json();
+    renderSdList(data.images || data, true);
+    log(`Image search: ${(data.images || data).length} image(s) found.`, 'ok');
+  } catch (e) {
+    list.innerHTML = `<div class="sd-empty" style="color:var(--red)">Error: ${e.message}</div>`;
+    log(`Search error: ${e.message}`, 'error');
+  }
+});
+
+function renderSdList(items, showPath = false) {
+  const list = document.getElementById('sdList');
+  list.innerHTML = '';
+  if (!items || !items.length) {
+    list.innerHTML = '<div class="sd-empty">Empty directory.</div>';
+    return;
+  }
+  items.forEach(item => {
+    const row = document.createElement('div');
+    row.className = 'sd-item';
+
+    const icon = document.createElement('span');
+    icon.className = 'sd-item-icon';
+    icon.textContent = item.is_file ? (item.type === 'image' ? '⬜' : item.type === 'raw' ? '◩' : '▤') : '▶';
+
+    const name = document.createElement('span');
+    name.className = 'sd-item-name';
+    name.textContent = showPath ? (item.path || item.name) : item.name;
+
+    const size = document.createElement('span');
+    size.className = 'sd-item-size';
+    size.textContent = item.size_formatted || '';
+
+    row.append(icon, name, size);
+
+    if (!item.is_file) {
+      row.title = 'Browse folder';
+      row.addEventListener('click', () => {
+        document.getElementById('sdPath').value = item.path;
+        browseFolder();
+      });
+    } else {
+      const dl = document.createElement('button');
+      dl.className = 'sd-item-dl';
+      dl.textContent = '↓';
+      dl.title = 'Download';
+      dl.addEventListener('click', e => {
+        e.stopPropagation();
+        downloadSdFile(item.folder, item.name);
+      });
+      row.appendChild(dl);
+    }
+    list.appendChild(row);
+  });
+}
+
+async function downloadSdFile(folder, filename) {
+  log(`Downloading SD file: ${folder}/${filename}`, 'warn');
+  try {
+    const res = await sdApi(`/sd/download?folder=${encodeURIComponent(folder)}&filename=${encodeURIComponent(filename)}`);
+    const blob = await res.blob();
+    const a = Object.assign(document.createElement('a'), {
+      href:     URL.createObjectURL(blob),
+      download: filename,
+    });
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    log(`Downloaded: ${filename} (${(blob.size/1024).toFixed(1)} KB)`, 'ok');
+    toast(`Downloaded ${filename}`, 'ok');
+  } catch (e) {
+    log(`Download error: ${e.message}`, 'error');
+    toast(e.message, 'err');
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+//  DETECT TAB
+// ═══════════════════════════════════════════════════════
+document.getElementById('btnDetect2').addEventListener('click', async () => {
+  const body = document.getElementById('detectBody');
+  const btn  = document.getElementById('btnDetect2');
+  body.innerHTML = '<div class="sd-empty"><span class="spinner"></span> Scanning USB bus…</div>';
+  btn.disabled = true;
+  try {
+    const data = await (await api('/detect')).json();
+    body.innerHTML = '';
+    if (!data.cameras || !data.cameras.length) {
+      body.innerHTML = '<div class="sd-empty">No cameras found. Check USB connection.</div>';
+      log('Scan complete: no cameras detected.', 'warn');
+      return;
+    }
+    data.cameras.forEach(cam => {
+      const card = document.createElement('div');
+      card.className = 'cam-card';
+      card.innerHTML = `
+        <div class="cam-card-model">${cam.model || 'Unknown Camera'}</div>
+        <div class="cam-card-port">Port: ${cam.port} &nbsp;·&nbsp; ${cam.source}</div>
+      `;
+      const connectBtn = document.createElement('button');
+      connectBtn.className = 'ctrl-btn primary';
+      connectBtn.textContent = '⟳ Connect This Camera';
+      connectBtn.style.width = '100%';
+      connectBtn.addEventListener('click', async () => {
+        try {
+          const res = await api(`/connect?port=${encodeURIComponent(cam.port)}`, { method: 'POST' });
+          const d = await res.json();
+          log(`Connected: ${d.camera_model} @ ${d.port}`, 'ok');
+          toast('Camera connected', 'ok');
+        } catch (e) {
+          log(`Connect error: ${e.message}`, 'error');
+          toast(e.message, 'err');
+        }
+      });
+      card.appendChild(connectBtn);
+      body.appendChild(card);
+    });
+    log(`Scan complete: ${data.cameras.length} camera(s) found.`, 'ok');
+    toast(`${data.cameras.length} camera(s) found`, 'ok');
+  } catch (e) {
+    body.innerHTML = `<div class="sd-empty" style="color:var(--red)">Error: ${e.message}</div>`;
+    log(`Detect error: ${e.message}`, 'error');
+    toast(e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⦿ Scan for USB Cameras';
+  }
+});
+
+// ═══════════════════════════════════════════════════════
+//  HEALTH TAB
+// ═══════════════════════════════════════════════════════
+document.getElementById('btnRefreshHealth').addEventListener('click', async () => {
+  const body = document.getElementById('healthBody');
+  body.innerHTML = '<div class="sd-empty"><span class="spinner"></span></div>';
+  try {
+    const data = await (await api('/health')).json();
+    body.innerHTML = '';
+
+    const metrics = [
+      { label: 'Status',          value: data.status,         color: data.status === 'healthy' ? 'green' : 'red' },
+      { label: 'Camera Model',    value: data.camera_model || '—' },
+      { label: 'Port',            value: data.port        || '—' },
+      { label: 'Streaming',       value: data.is_streaming ? 'YES' : 'NO', color: data.is_streaming ? 'green' : 'red' },
+      { label: 'Circuit Breaker', value: data.circuit_breaker || 'CLOSED', color: (data.circuit_breaker === 'OPEN') ? 'red' : 'green' },
+      { label: 'Polled At',       value: new Date().toLocaleTimeString() },
+    ];
+
+    metrics.forEach(m => {
+      const el = document.createElement('div');
+      el.className = 'health-metric';
+      el.innerHTML = `
+        <div class="health-metric-label">${m.label}</div>
+        <div class="health-metric-value" style="${m.color ? `color:var(--${m.color})` : ''}">${m.value}</div>
+      `;
+      body.appendChild(el);
+    });
+    log(`Health: ${data.status} — ${data.camera_model || 'unknown'}`, data.status === 'healthy' ? 'ok' : 'warn');
+  } catch (e) {
+    body.innerHTML = `<div class="sd-empty" style="color:var(--red)">Health check failed: ${e.message}</div>`;
+    log(`Health error: ${e.message}`, 'error');
+  }
+});
+
+// ═══════════════════════════════════════════════════════
+//  POLLING + BOOT
+// ═══════════════════════════════════════════════════════
+document.getElementById('baseUrl').addEventListener('input', () => {
+  log(`Base URL updated: ${baseUrl()}`, 'info');
+  updateSdUrlDisplay();
+});
+
+log('Ground Control v2 — system bus initialised.', 'ok');
+log('Configure Base Station URL and press ▶ Start.', 'info');
+
+updateSdUrlDisplay();
+pollStatus();
+state.pollInterval = setInterval(pollStatus, 2000);
+</script>
+</body>
+</html>
