@@ -101,16 +101,23 @@ class CameraLiveViewStreamer:
     # ------------------------------------------------------------------
 
     SETTINGS_KEYS: List[str] = [
-        "iso", "isospeed",
-        "shutterspeed", "shutter_speed",
-        "aperture", "f-number",
-        "whitebalance", "white_balance",
+        "iso",
+        "isospeed",
+        "shutterspeed",
+        "shutter_speed",
+        "aperture",
+        "f-number",
+        "whitebalance",
+        "white_balance",
         "exposurecompensation",
-        "imageformat", "imageformatcf", "imagequality",
+        "imageformat",
+        "imageformatcf",
+        "imagequality",
         "capturetarget",
         "colorspace",
         "picturestyle",
-        "autoexposuremode", "expprogram",
+        "autoexposuremode",
+        "expprogram",
         "drivemode",
     ]
 
@@ -129,6 +136,8 @@ class CameraLiveViewStreamer:
         self.is_initialized: bool = False
         self.selected_port: Optional[str] = None
         self.camera_model: str = "Unknown"
+        self.serial_number: str = "Unknown"
+        self.firmware_version: str = "Unknown"
 
         # Streaming
         self._streaming_event = threading.Event()
@@ -149,7 +158,7 @@ class CameraLiveViewStreamer:
         self.circuit_reset_timeout: float = 30.0
 
         # Concurrency primitives
-        self.lock = threading.Lock()                          # guards camera object
+        self.lock = threading.Lock()  # guards camera object
         # _async_lock is created lazily — see the property below
         self._async_lock_obj: Optional[asyncio.Lock] = None
         self._gphoto_executor = ThreadPoolExecutor(
@@ -192,7 +201,9 @@ class CameraLiveViewStreamer:
         self.consecutive_errors += 1
         logger.error(
             "Hardware error (%d/%d): %s",
-            self.consecutive_errors, self.error_threshold, error,
+            self.consecutive_errors,
+            self.error_threshold,
+            error,
         )
         if self.consecutive_errors >= self.error_threshold:
             self.circuit_broken_until = time.time() + self.circuit_reset_timeout
@@ -229,11 +240,117 @@ class CameraLiveViewStreamer:
             try:
                 subprocess.run(
                     ["pkill", "-f", proc],
-                    capture_output=True, text=True, timeout=2,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
                 )
             except Exception:
                 pass
         time.sleep(0.5)
+
+    def _find_config_value_fuzzy(
+        self, widget: gp.CameraWidget, keywords: List[str]
+    ) -> Optional[str]:
+        """Recursively search for a value in the config tree matching any keywords."""
+        try:
+            name = widget.get_name().lower()
+            label = widget.get_label().lower()
+
+            # Check if current widget matches any keyword
+            if any(kw in name or kw in label for kw in keywords):
+                # Only return if it's a value-bearing widget (not a window/section)
+                w_type = widget.get_type()
+                if w_type not in (
+                    gp.GP_WIDGET_SECTION,
+                    gp.GP_WIDGET_WINDOW,
+                    gp.GP_WIDGET_MENU,
+                ):
+                    val = str(widget.get_value()).strip()
+                    # Sanitize: ignore useless placeholders
+                    if val and val.lower() not in ("none", "0", "null", "unknown"):
+                        return val
+        except Exception:
+            pass
+
+        # Recurse into children if it's a container
+        try:
+            for i in range(widget.count_children()):
+                child = widget.get_child(i)
+                result = self._find_config_value_fuzzy(child, keywords)
+                if result:
+                    return result
+        except Exception:
+            pass
+
+        return None
+
+    def _get_hardware_info_sync(self, camera: gp.Camera) -> Dict[str, str]:
+        """
+        Attempt to read serial number and firmware from a connected camera.
+        Uses a multi-layered strategy: direct keys -> fuzzy search -> summary parsing.
+        """
+        info = {"serial_number": "Unknown", "firmware_version": "Unknown"}
+        try:
+            config = camera.get_config(self.context)
+
+            # 1. Tier 1: Try known standard direct keys (fastest)
+            direct_map = [
+                ("serialnumber", "serial_number"),
+                ("deviceid", "serial_number"),
+                ("firmwareversion", "firmware_version"),
+                ("cameramodelid", "serial_number"),
+            ]
+            for key, target in direct_map:
+                try:
+                    widget = config.get_child_by_name(key)
+                    val = str(widget.get_value()).strip()
+                    # Only accept if not "0" or "none" (some cams return "0" for unsupported keys)
+                    if val and val.lower() not in ("0", "none", "unknown"):
+                        info[target] = val
+                except Exception:
+                    continue
+
+            # 2. Tier 2: Fallback to Fuzzy Search (crawls the whole tree)
+            if info["serial_number"] == "Unknown":
+                info["serial_number"] = (
+                    self._find_config_value_fuzzy(config, ["serial", "deviceid"])
+                    or "Unknown"
+                )
+
+            if info["firmware_version"] == "Unknown":
+                info["firmware_version"] = (
+                    self._find_config_value_fuzzy(config, ["firmware", "version"])
+                    or "Unknown"
+                )
+
+            # 3. Tier 3: Final fallback - Parse the text summary
+            if (
+                info["serial_number"] == "Unknown"
+                or info["firmware_version"] == "Unknown"
+            ):
+                try:
+                    summary = str(camera.get_summary(self.context))
+                    if info["serial_number"] == "Unknown":
+                        # Look for "Serial Number: 123456" or "SN: 123456"
+                        match = re.search(
+                            r"(?:Serial(?:\s*Number)?|SN)[:\s]+([\w-]+)", summary, re.I
+                        )
+                        if match:
+                            info["serial_number"] = match.group(1).strip()
+
+                    if info["firmware_version"] == "Unknown":
+                        # Look for "Firmware Version: 1.0.2"
+                        match = re.search(
+                            r"Firmware(?:\s*Version)?[:\s]+([\w.-]+)", summary, re.I
+                        )
+                        if match:
+                            info["firmware_version"] = match.group(1).strip()
+                except Exception:
+                    pass
+
+        except Exception as exc:
+            logger.debug("Comprehensive hardware info read failed: %s", exc)
+        return info
 
     def _detect_usb_cameras_sync(self) -> List[Dict]:
         if not self._initialize_context():
@@ -241,7 +358,37 @@ class CameraLiveViewStreamer:
         cameras: List[Dict] = []
         try:
             for name, addr in gp.Camera.autodetect(self.context):
-                cameras.append({"model": name, "port": addr, "source": "libgphoto2"})
+                serial = "Unknown"
+                firmware = "Unknown"
+
+                # Quick-init to get serial if not the current one
+                if not (self.camera and self.selected_port == addr):
+                    try:
+                        tmp_cam = gp.Camera()
+                        pil = gp.PortInfoList()
+                        pil.load()
+                        idx = pil.lookup_path(addr)
+                        tmp_cam.set_port_info(pil[idx])
+                        tmp_cam.init(self.context)
+                        hw_info = self._get_hardware_info_sync(tmp_cam)
+                        serial = hw_info["serial_number"]
+                        firmware = hw_info["firmware_version"]
+                        tmp_cam.exit(self.context)
+                    except Exception:
+                        pass
+                else:
+                    serial = self.serial_number
+                    firmware = self.firmware_version
+
+                cameras.append(
+                    {
+                        "model": name,
+                        "port": addr,
+                        "serial_number": serial,
+                        "firmware_version": firmware,
+                        "source": "libgphoto2",
+                    }
+                )
             logger.info("Detected %d camera(s) via libgphoto2.", len(cameras))
         except Exception as exc:
             logger.debug("autodetect failed: %s", exc)
@@ -250,7 +397,9 @@ class CameraLiveViewStreamer:
             try:
                 r = subprocess.run(
                     ["gphoto2", "--auto-detect"],
-                    capture_output=True, text=True, timeout=5,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
                 )
                 for line in r.stdout.strip().split("\n")[2:]:
                     if line and "---" not in line:
@@ -260,7 +409,13 @@ class CameraLiveViewStreamer:
                             model = " ".join(parts[:-1])
                             if not any(c["port"] == port for c in cameras):
                                 cameras.append(
-                                    {"model": model, "port": port, "source": "cli"}
+                                    {
+                                        "model": model,
+                                        "port": port,
+                                        "source": "cli",
+                                        "serial_number": "Unknown",
+                                        "firmware_version": "Unknown",
+                                    }
                                 )
             except Exception as exc:
                 logger.debug("CLI detect failed: %s", exc)
@@ -293,6 +448,11 @@ class CameraLiveViewStreamer:
             summary = str(cam.get_summary(self.context))
             m = re.search(r"Model:\s*(.+)", summary)
             self.camera_model = m.group(1).strip() if m else summary[:80]
+
+            # Fetch serial/firmware immediately on init
+            hw_info = self._get_hardware_info_sync(cam)
+            self.serial_number = hw_info["serial_number"]
+            self.firmware_version = hw_info["firmware_version"]
         except Exception:
             pass
         self.camera = cam
@@ -300,7 +460,9 @@ class CameraLiveViewStreamer:
         logger.info("Camera ready: %s", self.camera_model)
         return True
 
-    def _initialise_with_liveview_sync(self, port: Optional[str] = None,save_to_sd: bool=True) -> bool:
+    def _initialise_with_liveview_sync(
+        self, port: Optional[str] = None, save_to_sd: bool = True
+    ) -> bool:
         """Connect + enable live-view.  Runs on executor thread."""
         self._cleanup_camera_sync()
         cameras = self._detect_usb_cameras_sync()
@@ -322,7 +484,7 @@ class CameraLiveViewStreamer:
             if self._set_config_sync(name, 1):
                 logger.info("Live-view enabled via '%s'.", name)
                 break
-        
+
         try:
             config = self.camera.get_config(self.context)
             child = config.get_child_by_name("capturetarget")
@@ -342,7 +504,7 @@ class CameraLiveViewStreamer:
                         break
                 if not target and choices:
                     target = choices[0]
-            
+
             if target:
                 self._set_config_sync("capturetarget", target)
         except Exception as exc:
@@ -373,6 +535,8 @@ class CameraLiveViewStreamer:
         finally:
             self.camera = None
             self.is_initialized = False
+            self.serial_number = "Unknown"
+            self.firmware_version = "Unknown"
 
     def _force_disconnect_port_sync(self, port: str) -> bool:
         """Perform a one-off initialization and exit on a specific port to release it."""
@@ -450,7 +614,9 @@ class CameraLiveViewStreamer:
                     self.camera.set_config(config, self.context)
                     logger.info("Step 1: Complete.")
                 except Exception as exc:
-                    logger.warning("Step 1: Atomic sync failed (viewfinder may block): %s", exc)
+                    logger.warning(
+                        "Step 1: Atomic sync failed (viewfinder may block): %s", exc
+                    )
 
                 # Step 2: Disable viewfinder to release mirror/data-bus.
                 logger.info("Step 2: Disabling viewfinder...")
@@ -468,17 +634,21 @@ class CameraLiveViewStreamer:
                 logger.info("Step 5: Reading hardware truth...")
                 try:
                     cfg = self.camera.get_config(self.context)
-                    iso     = cfg.get_child_by_name("iso").get_value()
-                    apt     = cfg.get_child_by_name("aperture").get_value()
+                    iso = cfg.get_child_by_name("iso").get_value()
+                    apt = cfg.get_child_by_name("aperture").get_value()
                     shutter = cfg.get_child_by_name("shutterspeed").get_value()
-                    mode    = cfg.get_child_by_name("autoexposuremode").get_value()
+                    mode = cfg.get_child_by_name("autoexposuremode").get_value()
                     logger.info(
                         "HARDWARE TRUTH — ISO: %s | Aperture: %s | Shutter: %s | Mode: %s",
-                        iso, apt, shutter, mode,
+                        iso,
+                        apt,
+                        shutter,
+                        mode,
                     )
                     if str(mode).strip().lower() not in ("manual", "m"):
                         logger.warning(
-                            "Camera dial is in '%s' — dial may override software settings.", mode
+                            "Camera dial is in '%s' — dial may override software settings.",
+                            mode,
                         )
                 except Exception as exc:
                     logger.debug("Hardware truth read skipped: %s", exc)
@@ -493,12 +663,18 @@ class CameraLiveViewStreamer:
                 for attempt in range(1, 4):
                     try:
                         logger.info("  Shutter attempt %d/3...", attempt)
-                        capture_info = self.camera.capture(gp.GP_CAPTURE_IMAGE, self.context)
-                        logger.info("  Captured: %s/%s", capture_info.folder, capture_info.name)
+                        capture_info = self.camera.capture(
+                            gp.GP_CAPTURE_IMAGE, self.context
+                        )
+                        logger.info(
+                            "  Captured: %s/%s", capture_info.folder, capture_info.name
+                        )
                         break
                     except gp.GPhoto2Error as exc:
                         if "I/O in progress" in str(exc) and attempt < 3:
-                            logger.warning("  I/O in progress (-110). Draining and retrying...")
+                            logger.warning(
+                                "  I/O in progress (-110). Draining and retrying..."
+                            )
                             self._drain_events_sync(1000)
                         else:
                             raise
@@ -510,8 +686,11 @@ class CameraLiveViewStreamer:
                 logger.info("Step 8: Retrieving image data...")
                 cf = gp.CameraFile()
                 self.camera.file_get(
-                    capture_info.folder, capture_info.name,
-                    gp.GP_FILE_TYPE_NORMAL, cf, self.context,
+                    capture_info.folder,
+                    capture_info.name,
+                    gp.GP_FILE_TYPE_NORMAL,
+                    cf,
+                    self.context,
                 )
                 file_data = bytes(cf.get_data_and_size())
 
@@ -560,9 +739,11 @@ class CameraLiveViewStreamer:
     def extract_image_metadata(self, file_data: bytes, filename: str) -> Dict[str, Any]:
         import struct
         metadata: Dict[str, Any] = {
-            "width_px": 0, "height_px": 0,
+            "width_px": 0,
+            "height_px": 0,
             "dpi": 300,
-            "width_mm": 0.0, "height_mm": 0.0,
+            "width_mm": 0.0,
+            "height_mm": 0.0,
             "format": "Unknown",
         }
         if file_data[:2] == b"\xff\xd8":
@@ -587,7 +768,8 @@ class CameraLiveViewStreamer:
                 if img is not None:
                     h, w = img.shape[:2]
                     metadata.update(
-                        width_px=w, height_px=h,
+                        width_px=w,
+                        height_px=h,
                         width_mm=round((w / dpi) * 25.4, 2),
                         height_mm=round((h / dpi) * 25.4, 2),
                     )
@@ -598,18 +780,25 @@ class CameraLiveViewStreamer:
             try:
                 endian = "<" if file_data[:2] == b"II" else ">"
                 ifd_offset = struct.unpack(endian + "I", file_data[4:8])[0]
-                num_entries = struct.unpack(endian + "H", file_data[ifd_offset:ifd_offset + 2])[0]
+                num_entries = struct.unpack(
+                    endian + "H", file_data[ifd_offset : ifd_offset + 2]
+                )[0]
                 w_px = h_px = 0
                 for i in range(num_entries):
                     off = ifd_offset + 2 + i * 12
-                    tag = struct.unpack(endian + "H", file_data[off:off + 2])[0]
+                    tag = struct.unpack(endian + "H", file_data[off : off + 2])[0]
                     if tag == 256:
-                        w_px = struct.unpack(endian + "I", file_data[off + 8:off + 12])[0]
+                        w_px = struct.unpack(
+                            endian + "I", file_data[off + 8 : off + 12]
+                        )[0]
                     elif tag == 257:
-                        h_px = struct.unpack(endian + "I", file_data[off + 8:off + 12])[0]
+                        h_px = struct.unpack(
+                            endian + "I", file_data[off + 8 : off + 12]
+                        )[0]
                 if w_px and h_px:
                     metadata.update(
-                        width_px=w_px, height_px=h_px,
+                        width_px=w_px,
+                        height_px=h_px,
                         width_mm=round((w_px / dpi) * 25.4, 2),
                         height_mm=round((h_px / dpi) * 25.4, 2),
                     )
@@ -634,7 +823,9 @@ class CameraLiveViewStreamer:
                 try:
                     target: Any = int(value)
                 except (ValueError, TypeError):
-                    logger.error("Cannot cast %r to int for TOGGLE widget '%s'.", value, name)
+                    logger.error(
+                        "Cannot cast %r to int for TOGGLE widget '%s'.", value, name
+                    )
                     return False
             elif w_type in (gp.GP_WIDGET_MENU, gp.GP_WIDGET_RADIO, gp.GP_WIDGET_TEXT):
                 target = str(value)
@@ -642,7 +833,9 @@ class CameraLiveViewStreamer:
                 try:
                     target = float(value)
                 except (ValueError, TypeError):
-                    logger.error("Cannot cast %r to float for RANGE widget '%s'.", value, name)
+                    logger.error(
+                        "Cannot cast %r to float for RANGE widget '%s'.", value, name
+                    )
                     return False
             else:
                 target = value
@@ -650,8 +843,16 @@ class CameraLiveViewStreamer:
             # Skip write if already at desired value.
             try:
                 current = child.get_value()
-                cmp_a = str(current) if w_type in (gp.GP_WIDGET_MENU, gp.GP_WIDGET_RADIO) else current
-                cmp_b = str(target)  if w_type in (gp.GP_WIDGET_MENU, gp.GP_WIDGET_RADIO) else target
+                cmp_a = (
+                    str(current)
+                    if w_type in (gp.GP_WIDGET_MENU, gp.GP_WIDGET_RADIO)
+                    else current
+                )
+                cmp_b = (
+                    str(target)
+                    if w_type in (gp.GP_WIDGET_MENU, gp.GP_WIDGET_RADIO)
+                    else target
+                )
                 if cmp_a == cmp_b:
                     logger.debug("'%s' already at %r, skipping write.", name, target)
                     return True
@@ -660,9 +861,13 @@ class CameraLiveViewStreamer:
 
             # Validate choice membership.
             if w_type in (gp.GP_WIDGET_MENU, gp.GP_WIDGET_RADIO):
-                choices = [str(child.get_choice(i)) for i in range(child.count_choices())]
+                choices = [
+                    str(child.get_choice(i)) for i in range(child.count_choices())
+                ]
                 if str(target) not in choices:
-                    logger.error("Invalid choice for '%s': %r. Valid: %s", name, target, choices)
+                    logger.error(
+                        "Invalid choice for '%s': %r. Valid: %s", name, target, choices
+                    )
                     return False
 
             child.set_value(target)
@@ -731,7 +936,9 @@ class CameraLiveViewStreamer:
                 else:
                     stale = time.time() - self.last_frame_time
                     if self.last_frame_time > 0 and stale > self.watchdog_timeout:
-                        logger.critical("WATCHDOG: stream stale for %.1fs — forcing reset.", stale)
+                        logger.critical(
+                            "WATCHDOG: stream stale for %.1fs — forcing reset.", stale
+                        )
                         self._gphoto_executor.submit(self._cleanup_camera_sync)
                         time.sleep(1.0)
 
@@ -768,7 +975,7 @@ class CameraLiveViewStreamer:
     # ------------------------------------------------------------------
     # Public async API — camera / stream
     # ------------------------------------------------------------------
-## target = "Memory card" if save_to_sd else "Internal RAM"
+    ## target = "Memory card" if save_to_sd else "Internal RAM"
     async def detect_usb_cameras(self) -> List[Dict]:
         async with self._async_lock:
             return await self._run(self._detect_usb_cameras_sync)
@@ -780,16 +987,24 @@ class CameraLiveViewStreamer:
         """
         return await self.detect_usb_cameras()
 
-    async def connect_to_camera(self, port: Optional[str] = None, save_to_sd: bool = True) -> bool:
+    async def connect_to_camera(
+        self, port: Optional[str] = None, save_to_sd: bool = True
+    ) -> bool:
         async with self._async_lock:
-            return await self._run(self._initialise_with_liveview_sync, port,save_to_sd)
+            return await self._run(
+                self._initialise_with_liveview_sync, port, save_to_sd
+            )
 
-    async def start_streaming(self, port: Optional[str] = None, save_to_sd: bool = True) -> bool:
+    async def start_streaming(
+        self, port: Optional[str] = None, save_to_sd: bool = True
+    ) -> bool:
         if self.is_streaming:
             logger.warning("Stream already running.")
             return True
         async with self._async_lock:
-            if not await self._run(self._initialise_with_liveview_sync, port,save_to_sd):
+            if not await self._run(
+                self._initialise_with_liveview_sync, port, save_to_sd
+            ):
                 return False
         self._streaming_event.set()
         self.last_frame_time = time.time()
@@ -815,7 +1030,8 @@ class CameraLiveViewStreamer:
         if self.stream_thread and self.stream_thread.is_alive():
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
-                None, lambda: self.stream_thread.join(timeout=3.0)  # type: ignore[union-attr]
+                None,
+                lambda: self.stream_thread.join(timeout=3.0),  # type: ignore[union-attr]
             )
             if self.stream_thread.is_alive():
                 logger.warning("Stream thread did not stop gracefully.")
@@ -832,11 +1048,15 @@ class CameraLiveViewStreamer:
         """
         # If no specific port is targeted, and we aren't even initialized, error out.
         if not port and not self.is_initialized and not self.camera:
-            logger.warning("Disconnect requested, but no camera is currently connected.")
+            logger.warning(
+                "Disconnect requested, but no camera is currently connected."
+            )
             raise CameraNotConnectedError("No camera is currently connected.")
 
         if port and self.selected_port != port:
-            logger.info("Force-disconnecting camera at port %s (different from current)", port)
+            logger.info(
+                "Force-disconnecting camera at port %s (different from current)", port
+            )
             return await self._run(self._force_disconnect_port_sync, port)
 
         if self.is_streaming:
@@ -890,7 +1110,9 @@ class CameraLiveViewStreamer:
         q: asyncio.Queue = asyncio.Queue(maxsize=1)
         with self._subscribers_lock:
             self._subscribers.append(q)
-            logger.debug("Client connected. Active subscribers: %d", len(self._subscribers))
+            logger.debug(
+                "Client connected. Active subscribers: %d", len(self._subscribers)
+            )
 
         try:
             while self.is_streaming:
@@ -899,11 +1121,16 @@ class CameraLiveViewStreamer:
                     yield (
                         b"--" + boundary + b"\r\n"
                         b"Content-Type: image/jpeg\r\n"
-                        b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n"
-                        + frame + b"\r\n"
+                        b"Content-Length: "
+                        + str(len(frame)).encode()
+                        + b"\r\n\r\n"
+                        + frame
+                        + b"\r\n"
                     )
                 except asyncio.TimeoutError:
-                    placeholder = self._create_placeholder_frame("Signal Lost — Reconnecting...")
+                    placeholder = self._create_placeholder_frame(
+                        "Signal Lost — Reconnecting..."
+                    )
                     yield (
                         b"--" + boundary + b"\r\n"
                         b"Content-Type: image/jpeg\r\n\r\n" + placeholder + b"\r\n"
@@ -912,32 +1139,47 @@ class CameraLiveViewStreamer:
             with self._subscribers_lock:
                 if q in self._subscribers:
                     self._subscribers.remove(q)
-            logger.debug("Client disconnected. Remaining subscribers: %d", len(self._subscribers))
+            logger.debug(
+                "Client disconnected. Remaining subscribers: %d", len(self._subscribers)
+            )
 
     def _create_placeholder_frame(self, message: str) -> bytes:
         img = np.zeros((480, 640, 3), dtype=np.uint8)
-        for i, text in enumerate([
-            f"Camera: {self.camera_model}",
-            f"Port:   {self.selected_port or 'Auto'}",
-            message,
-        ]):
-            cv2.putText(img, text, (50, 100 + i * 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        for i, text in enumerate(
+            [
+                f"Camera: {self.camera_model}",
+                f"Port:   {self.selected_port or 'Auto'}",
+                message,
+            ]
+        ):
+            cv2.putText(
+                img,
+                text,
+                (50, 100 + i * 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+            )
         _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
         return buf.tobytes()
 
     def get_status(self) -> Dict[str, Any]:
         cb_open = time.time() < self.circuit_broken_until
         return {
-            "is_streaming":       self.is_streaming,
-            "camera_model":       self.camera_model,
-            "selected_port":      self.selected_port,
-            "subscribers":        len(self._subscribers),
-            "frame_count":        self.frame_count,
-            "camera_connected":   bool(self.camera and self.is_initialized),
-            "is_initialized":     self.is_initialized,
-            "circuit_breaker":    "OPEN" if cb_open else "CLOSED",
-            "cb_retry_in_s":      max(0, int(self.circuit_broken_until - time.time())) if cb_open else 0,
+            "is_streaming": self.is_streaming,
+            "camera_model": self.camera_model,
+            "serial_number": self.serial_number,
+            "firmware_version": self.firmware_version,
+            "selected_port": self.selected_port,
+            "subscribers": len(self._subscribers),
+            "frame_count": self.frame_count,
+            "camera_connected": bool(self.camera and self.is_initialized),
+            "is_initialized": self.is_initialized,
+            "circuit_breaker": "OPEN" if cb_open else "CLOSED",
+            "cb_retry_in_s": max(0, int(self.circuit_broken_until - time.time()))
+            if cb_open
+            else 0,
             "consecutive_errors": self.consecutive_errors,
         }
 
@@ -972,12 +1214,14 @@ class CameraLiveViewStreamer:
                 w_type = widget.get_type()
                 choices = []
                 if w_type in (gp.GP_WIDGET_MENU, gp.GP_WIDGET_RADIO):
-                    choices = [widget.get_choice(i) for i in range(widget.count_choices())]
+                    choices = [
+                        widget.get_choice(i) for i in range(widget.count_choices())
+                    ]
                 result[key] = {
-                    "value":    widget.get_value(),
-                    "label":    widget.get_label(),
-                    "type":     w_type,
-                    "choices":  choices,
+                    "value": widget.get_value(),
+                    "label": widget.get_label(),
+                    "type": w_type,
+                    "choices": choices,
                     "readonly": bool(widget.get_readonly()),
                 }
             except Exception:
@@ -1001,7 +1245,7 @@ class CameraLiveViewStreamer:
             raise CameraNotConnectedError("Camera not initialised.")
 
         applied: Dict = {}
-        failed:  Dict = {}
+        failed: Dict = {}
 
         was_streaming = self._streaming_event.is_set()
         # Capture the running loop NOW (we're on the executor thread called from async context).
@@ -1083,7 +1327,9 @@ class CameraLiveViewStreamer:
                     parts = folder.split("/", 2)
                     if len(parts) > 2:
                         fallback = "/" + parts[2]
-                        logger.info("Empty result for %s — trying fallback %s", folder, fallback)
+                        logger.info(
+                            "Empty result for %s — trying fallback %s", folder, fallback
+                        )
                         contents = self._do_list_folder_sync(fallback)
 
             self._on_hardware_success()
@@ -1101,7 +1347,7 @@ class CameraLiveViewStreamer:
             raw_files = self.camera.folder_list_files(folder, self.context)
             for i in range(raw_files.count()):
                 name = raw_files.get_name(i)
-                ext  = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+                ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
                 size = 0
                 try:
                     info = self.camera.file_get_info(folder, name, self.context)
@@ -1109,17 +1355,26 @@ class CameraLiveViewStreamer:
                 except Exception:
                     pass
                 ftype = (
-                    "image" if ext in {"jpg", "jpeg", "png", "bmp", "tiff", "tif"} else
-                    "raw"   if ext in {"cr2", "cr3", "nef", "arw", "dng"} else
-                    "video" if ext in {"mp4", "avi", "mov", "mkv"} else
-                    "file"
+                    "image"
+                    if ext in {"jpg", "jpeg", "png", "bmp", "tiff", "tif"}
+                    else "raw"
+                    if ext in {"cr2", "cr3", "nef", "arw", "dng"}
+                    else "video"
+                    if ext in {"mp4", "avi", "mov", "mkv"}
+                    else "file"
                 )
-                contents.append({
-                    "name": name, "type": ftype,
-                    "size": size, "size_formatted": self._format_size(size),
-                    "path": (folder + "/" + name).replace("//", "/"),
-                    "folder": folder, "extension": ext, "is_file": True,
-                })
+                contents.append(
+                    {
+                        "name": name,
+                        "type": ftype,
+                        "size": size,
+                        "size_formatted": self._format_size(size),
+                        "path": (folder + "/" + name).replace("//", "/"),
+                        "folder": folder,
+                        "extension": ext,
+                        "is_file": True,
+                    }
+                )
         except Exception as exc:
             logger.debug("File listing failed for %s: %s", folder, exc)
 
@@ -1127,12 +1382,18 @@ class CameraLiveViewStreamer:
             raw_folders = self.camera.folder_list_folders(folder, self.context)
             for i in range(raw_folders.count()):
                 name = raw_folders.get_name(i)
-                contents.append({
-                    "name": name, "type": "folder",
-                    "size": 0, "size_formatted": "—",
-                    "path": (folder + "/" + name).replace("//", "/"),
-                    "folder": folder, "extension": "", "is_file": False,
-                })
+                contents.append(
+                    {
+                        "name": name,
+                        "type": "folder",
+                        "size": 0,
+                        "size_formatted": "—",
+                        "path": (folder + "/" + name).replace("//", "/"),
+                        "folder": folder,
+                        "extension": "",
+                        "is_file": False,
+                    }
+                )
         except Exception as exc:
             logger.debug("Folder listing failed for %s: %s", folder, exc)
 
@@ -1146,7 +1407,9 @@ class CameraLiveViewStreamer:
         extensions: Optional[List[str]] = None,
     ) -> List[Dict]:
         async with self._async_lock:
-            return await self._run(self._search_images_sync, folder, recursive, extensions)
+            return await self._run(
+                self._search_images_sync, folder, recursive, extensions
+            )
 
     def _search_images_sync(
         self,
@@ -1187,13 +1450,17 @@ class CameraLiveViewStreamer:
         images.sort(key=lambda x: x["name"].lower(), reverse=True)
         return images
 
-    async def download_image(self, folder: str, filename: str) -> Tuple[bytes, str, Dict]:
+    async def download_image(
+        self, folder: str, filename: str
+    ) -> Tuple[bytes, str, Dict]:
         async with self._async_lock:
             return await self._run(self._download_image_sync, folder, filename)
 
-    def _download_image_sync(self, folder: str, filename: str) -> Tuple[bytes, str, Dict]:
+    def _download_image_sync(
+        self, folder: str, filename: str
+    ) -> Tuple[bytes, str, Dict]:
         safe = self._validate_sd_path(folder, filename)
-        dir_name  = os.path.dirname(safe)
+        dir_name = os.path.dirname(safe)
         file_name = os.path.basename(safe)
         with self.lock:
             if not (self.camera and self.is_initialized):
@@ -1204,7 +1471,8 @@ class CameraLiveViewStreamer:
             )
             data = bytes(cf.get_data_and_size())
         meta = {
-            "filename": file_name, "folder": dir_name,
+            "filename": file_name,
+            "folder": dir_name,
             "full_path": safe,
             "size_bytes": len(data),
             "size_formatted": self._format_size(len(data)),
@@ -1257,25 +1525,31 @@ class CameraLiveViewStreamer:
     async def download_multiple_images(self, file_list: List[Dict]) -> List[Dict]:
         results = []
         for fi in file_list:
-            folder   = fi.get("folder", "/")
+            folder = fi.get("folder", "/")
             filename = fi.get("filename")
             if not filename:
-                results.append({"success": False, "error": "Missing filename", "original": fi})
+                results.append(
+                    {"success": False, "error": "Missing filename", "original": fi}
+                )
                 continue
             try:
                 data, name, meta = await self.download_image(folder, str(filename))
-                results.append({
-                    "success": True,
-                    "original_path": f"{folder}/{filename}",
-                    "suggested_filename": name,
-                    "size_bytes": len(data),
-                    "size_formatted": meta["size_formatted"],
-                    "metadata": meta,
-                    "data": data,
-                })
+                results.append(
+                    {
+                        "success": True,
+                        "original_path": f"{folder}/{filename}",
+                        "suggested_filename": name,
+                        "size_bytes": len(data),
+                        "size_formatted": meta["size_formatted"],
+                        "metadata": meta,
+                        "data": data,
+                    }
+                )
             except Exception as exc:
                 logger.error("Failed to download %s: %s", fi, exc)
-                results.append({"success": False, "original_path": str(fi), "error": str(exc)})
+                results.append(
+                    {"success": False, "original_path": str(fi), "error": str(exc)}
+                )
         return results
 
     async def delete_image(self, folder: str, filename: str) -> bool:
@@ -1333,7 +1607,8 @@ class CameraLiveViewStreamer:
                 h, w = img.shape[:2]
                 scale = min(max_width / w, max_height / h)
                 img = cv2.resize(
-                    img, (int(w * scale), int(h * scale)),
+                    img,
+                    (int(w * scale), int(h * scale)),
                     interpolation=cv2.INTER_AREA,
                 )
                 _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -1368,8 +1643,13 @@ class CameraLiveViewStreamer:
     def _thumbnail_placeholder(self, filename: str, w: int, h: int) -> bytes:
         img = np.full((h, w, 3), 200, dtype=np.uint8)
         cv2.putText(
-            img, str(filename)[:15], (10, h // 2),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (50, 50, 50), 1,
+            img,
+            str(filename)[:15],
+            (10, h // 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (50, 50, 50),
+            1,
         )
         _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
         return buf.tobytes()

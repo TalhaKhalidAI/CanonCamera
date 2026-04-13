@@ -127,7 +127,13 @@ async def connect_camera(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=f"Failed to connect to camera at port {port!r}.",
             )
-        return {"status": "connected", "port": port, "camera_model": clsr.camera_model}
+        return {
+            "status": "connected",
+            "port": port,
+            "camera_model": clsr.camera_model,
+            "serial_number": clsr.serial_number,
+            "firmware_version": clsr.firmware_version,
+        }
     except HTTPException:
         raise
     except Exception as exc:
@@ -248,6 +254,8 @@ async def start_stream(
     return {
         "status": "started",
         "camera_model": clsr.camera_model,
+        "serial_number": clsr.serial_number,
+        "firmware_version": clsr.firmware_version,
         "port": clsr.selected_port,
         "stream_url": f"{API_PREFIX}/livestream",
     }
