@@ -374,6 +374,26 @@ class CameraLiveViewStreamer:
             self.camera = None
             self.is_initialized = False
 
+    def _force_disconnect_port_sync(self, port: str) -> bool:
+        """Perform a one-off initialization and exit on a specific port to release it."""
+        if not self._initialize_context():
+            return False
+        try:
+            cam = gp.Camera()
+            pil = gp.PortInfoList()
+            pil.load()
+            idx = pil.lookup_path(port)
+            cam.set_port_info(pil[idx])
+
+            # Init then exit immediately to release the device from gphoto2 perspective
+            cam.init(self.context)
+            cam.exit(self.context)
+            logger.info("Force-release successful for port: %s", port)
+            return True
+        except Exception as exc:
+            logger.warning("Force-release failed for port %s: %s", port, exc)
+            return False
+
     def _capture_frame_sync(self) -> Optional[bytes]:
         try:
             self._check_circuit_breaker()
@@ -753,6 +773,13 @@ class CameraLiveViewStreamer:
         async with self._async_lock:
             return await self._run(self._detect_usb_cameras_sync)
 
+    async def get_all_cameras(self) -> List[Dict]:
+        """
+        Detect and return all connected USB cameras.
+        This provides a public method to scan for available hardware.
+        """
+        return await self.detect_usb_cameras()
+
     async def connect_to_camera(self, port: Optional[str] = None, save_to_sd: bool = True) -> bool:
         async with self._async_lock:
             return await self._run(self._initialise_with_liveview_sync, port,save_to_sd)
@@ -796,6 +823,31 @@ class CameraLiveViewStreamer:
             await self._run(self._disable_liveview_sync)
             await self._run(self._cleanup_camera_sync)
         logger.info("Streaming stopped.")
+
+    async def disconnect_camera(self, port: Optional[str] = None) -> bool:
+        """
+        Safely disconnect the camera, stopping any active stream first.
+        If a port is provided and it's not the currently active camera,
+        it performs a one-off init/exit on that port to release it.
+        """
+        # If no specific port is targeted, and we aren't even initialized, error out.
+        if not port and not self.is_initialized and not self.camera:
+            logger.warning("Disconnect requested, but no camera is currently connected.")
+            raise CameraNotConnectedError("No camera is currently connected.")
+
+        if port and self.selected_port != port:
+            logger.info("Force-disconnecting camera at port %s (different from current)", port)
+            return await self._run(self._force_disconnect_port_sync, port)
+
+        if self.is_streaming:
+            logger.info("Disconnecting camera: stopping active stream...")
+            await self.stop_streaming()
+        else:
+            async with self._async_lock:
+                await self._run(self._cleanup_camera_sync)
+
+        logger.info("Camera disconnected safely.")
+        return True
 
     async def capture_photo(self, keep_on_sd: bool = False) -> Tuple[bytes, str]:
         """

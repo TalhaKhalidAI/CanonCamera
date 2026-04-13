@@ -1,39 +1,12 @@
-"""
-camera_routes.py — FastAPI routes for Canon DSLR control.
-
-Fixes over previous version
-----------------------------
-* Duplicate APIRouter definition removed — the file previously defined
-  cam_route twice, silently discarding the first set of routes.
-* Duplicate import block removed.
-* capture_photo() now unpacks (bytes, str) — matches the updated
-  DLSR_Helper.py contract (metadata is no longer a return value).
-* /capture/detailed calls extract_image_metadata() explicitly instead of
-  relying on a third return value that no longer exists.
-* Internal camera-check uses get_status()["camera_connected"] instead of
-  accessing clsr.camera directly (private attribute).
-* CameraHardwareError / CircuitBreakerOpenError mapped to explicit HTTP
-  status codes (503 / 429) instead of a generic 500.
-* Content-Disposition filename is RFC 6266 quoted.
-* Error detail no longer leaks raw exception text to clients; details are
-  logged server-side and a safe message is returned.
-* Auth dependencies are consistently present (commented stubs kept where
-  intentionally disabled, with a TODO marker).
-* /test endpoint auth flags reflect actual state.
-* API_PREFIX constant eliminates hard-coded /app/v1/ in the HTML UI.
-"""
-
 import base64
 import time
 from typing import Dict, Optional
-
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response, status
 from fastapi.responses import HTMLResponse, StreamingResponse
-
 from App.api.dependencies.camera import CameraLiveViewStreamer, get_camera_streamer
 from App.core.LoggingInit import get_core_logger
 from App.repository.DLSR_Helper import CameraHardwareError, CircuitBreakerOpenError, CameraNotConnectedError
-
+from App.api.dependencies.auth import get_current_user
 # TODO: re-enable when auth middleware is wired up
 # from App.api.dependencies.auth import get_current_active_user
 
@@ -157,6 +130,48 @@ async def connect_camera(
         return {"status": "connected", "port": port, "camera_model": clsr.camera_model}
     except HTTPException:
         raise
+    except Exception as exc:
+        raise _map_hardware_error(exc)
+
+
+@cam_route.get("/cameras")
+async def get_all_cameras(
+    clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
+):
+    """Detect and return all connected USB cameras."""
+    try:
+        cameras = await clsr.get_all_cameras()
+        return {
+            "status": "success",
+            "cameras_found": len(cameras),
+            "cameras": cameras,
+        }
+    except Exception as exc:
+        raise _map_hardware_error(exc)
+
+
+@cam_route.post("/disconnect")
+async def disconnect_camera(
+    port: Optional[str] = Query(None, description="Optional USB port to force-disconnect"),
+    clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
+):
+    """
+    Safely disconnect the currently active camera or a specific port.
+    Stops any active stream before disconnecting.
+    """
+    try:
+        # disconnect_camera returns True on success, or False if force-release fails
+        success = await clsr.disconnect_camera(port)
+        if not success and port:
+             raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to force-disconnect camera at port {port!r}.",
+            )
+        return {
+            "status": "success",
+            "message": "Camera disconnected safely",
+            "port": port or clsr.selected_port
+        }
     except Exception as exc:
         raise _map_hardware_error(exc)
 
@@ -415,7 +430,9 @@ async def test_endpoint():
         "endpoints": [
             # auth column reflects actual current state (all TODO: pending)
             {"path": f"{API_PREFIX}/detect",          "method": "GET",   "auth": False},
+            {"path": f"{API_PREFIX}/cameras",         "method": "GET",   "auth": False},
             {"path": f"{API_PREFIX}/connect",         "method": "POST",  "auth": False},
+            {"path": f"{API_PREFIX}/disconnect",      "method": "POST",  "auth": False},
             {"path": f"{API_PREFIX}/livestream",      "method": "GET",   "auth": False},
             {"path": f"{API_PREFIX}/start",           "method": "POST",  "auth": False},
             {"path": f"{API_PREFIX}/stop",            "method": "POST",  "auth": False},
