@@ -173,11 +173,16 @@ class CurrencyRepository:
             raise e
 
     async def delete(self, currency_id: int) -> bool:
-        """Soft delete a currency. Checks if not already deleted/disabled."""
+        """Soft delete a currency. Checks if not already deleted."""
         try:
-            currency = await self.get_by_id(currency_id)
+            # Fetch including deleted for a specific error message
+            currency = await self.get_by_id(currency_id, include_deleted=True)
+            
             if not currency:
-                return False
+                raise ValueError(f"Currency with ID {currency_id} not found")
+            
+            if currency.deleted:
+                raise ValueError(f"Currency {currency.code} is already deleted")
             
             if currency.is_default:
                 raise ValueError("Cannot delete the default currency")
@@ -197,19 +202,22 @@ class CurrencyRepository:
         """Restore a soft-deleted currency."""
         try:
             currency = await self._get_raw(currency_id)
-            if not currency or not currency.deleted:
-                return False
+            if not currency:
+                raise ValueError(f"Currency with ID {currency_id} not found")
+            if not currency.deleted:
+                raise ValueError(f"Currency {currency.code} is not deleted and cannot be restored")
             
             currency.deleted = False
             currency.is_active = True
             await self.session.commit()
             
-            logger.info(f"Restored currency ID {currency_id}")
+            await self.session.refresh(currency)
+            logger.info(f"Restored currency: {currency.code}")
             return True
         except Exception as e:
             await self.session.rollback()
             logger.error(f"Error restoring currency {currency_id}: {e}")
-            return False
+            raise e
 
     async def set_status(self, currency_id: int, is_active: bool = True, disabled: bool = False) -> bool:
         """Enable or disable a currency."""
