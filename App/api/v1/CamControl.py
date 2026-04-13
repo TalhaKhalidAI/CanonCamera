@@ -1,14 +1,14 @@
 import base64
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional,Any
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response, status
 from fastapi.responses import HTMLResponse, StreamingResponse
 from App.api.dependencies.camera import CameraLiveViewStreamer, get_camera_streamer
 from App.core.LoggingInit import get_core_logger
 from App.repository.DLSR_Helper import CameraHardwareError, CircuitBreakerOpenError, CameraNotConnectedError
-from App.api.dependencies.auth import get_current_user
+from App.api.dependencies.auth import get_current_user 
 # TODO: re-enable when auth middleware is wired up
-# from App.api.dependencies.auth import get_current_active_user
+# from App.api.dependencies.auth import get_current_user
 
 logger = get_core_logger(__name__)
 
@@ -47,6 +47,8 @@ async def _ensure_connected(clsr: CameraLiveViewStreamer) -> None:
 
 def _map_hardware_error(exc: Exception) -> HTTPException:
     """Convert camera-layer exceptions to appropriate HTTP status codes."""
+    if isinstance(exc, HTTPException):
+        return exc
     if isinstance(exc, CircuitBreakerOpenError):
         return HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -86,11 +88,15 @@ def _content_type_from_bytes(data: bytes) -> str:
 
 @cam_route.get("/detect")
 async def detect_cameras(
+    current_user: Dict[str, Any] = Depends(get_current_user),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    # _user=Depends(get_current_active_user),  # TODO: enable
+    # _user=Depends(get_current_user),  # TODO: enable
 ):
     """Detect all available USB cameras."""
     try:
+        cur=current_user.get("role")
+        if cur=="guest" or cur=="viewer":
+            raise  HTTPException(403,"Not enough permissions")
         cameras = await clsr.detect_usb_cameras()
         return {
             "status": "success",
@@ -104,13 +110,17 @@ async def detect_cameras(
 
 @cam_route.post("/connect")
 async def connect_camera(
+    current_user: Dict[str, Any] = Depends(get_current_user),
     port: Optional[str] = Query(None, description="USB port string, e.g. usb:001,005"),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
     save_to_sd: bool = Query(True),
-    # _user=Depends(get_current_active_user),  # TODO: enable
+    # _user=Depends(get_current_user),  # TODO: enable
 ):
     """Connect to a specific camera port, or auto-select the first detected."""
     try:
+        cur=current_user.get("role")
+        if cur=="guest" or cur=="viewer":
+            raise  HTTPException(403,"Not enough permissions")
         if not port:
             cameras = await clsr.detect_usb_cameras()
             if not cameras:
@@ -134,18 +144,20 @@ async def connect_camera(
             "serial_number": clsr.serial_number,
             "firmware_version": clsr.firmware_version,
         }
-    except HTTPException:
-        raise
     except Exception as exc:
         raise _map_hardware_error(exc)
 
 
 @cam_route.get("/cameras")
 async def get_all_cameras(
+    current_user: Dict[str, Any] = Depends(get_current_user),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
 ):
     """Detect and return all connected USB cameras."""
     try:
+        cur=current_user.get("role")
+        if cur=="guest" or cur=="viewer":
+            raise  HTTPException(403,"Not enough permissions")
         cameras = await clsr.get_all_cameras()
         return {
             "status": "success",
@@ -158,6 +170,7 @@ async def get_all_cameras(
 
 @cam_route.post("/disconnect")
 async def disconnect_camera(
+    current_user: Dict[str, Any] = Depends(get_current_user),
     port: Optional[str] = Query(None, description="Optional USB port to force-disconnect"),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
 ):
@@ -166,6 +179,9 @@ async def disconnect_camera(
     Stops any active stream before disconnecting.
     """
     try:
+        cur=current_user.get("role")
+        if cur=="guest" or cur=="viewer":
+            raise  HTTPException(403,"Not enough permissions")
         # disconnect_camera returns True on success, or False if force-release fails
         success = await clsr.disconnect_camera(port)
         if not success and port:
@@ -188,11 +204,15 @@ async def disconnect_camera(
 
 @cam_route.get("/settings")
 async def get_settings(
+    current_user: Dict[str, Any] = Depends(get_current_user),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    # _user=Depends(get_current_active_user),  # TODO: enable
+    # _user=Depends(get_current_user),  # TODO: enable
 ):
     """Fetch current camera settings and their allowed values."""
     try:
+        cur=current_user.get("role")
+        if cur=="guest" or cur=="viewer":
+            raise  HTTPException(403,"Not enough permissions")
         settings = await clsr.get_camera_settings()
         return {"status": "success", "settings": settings}
     except Exception as exc:
@@ -201,14 +221,19 @@ async def get_settings(
 
 @cam_route.patch("/settings")
 async def update_settings(
+    current_user: Dict[str, Any] = Depends(get_current_user),
     settings: Dict[str, str] = Body(..., example={"iso": "400", "shutterspeed": "1/125"}),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    # _user=Depends(get_current_active_user),  # TODO: enable
+    # _user=Depends(get_current_user),  # TODO: enable
 ):
     """
     Update one or more camera settings.
     Returns which keys were applied and which were rejected.
     """
+    cur=current_user.get("role")
+    if cur=="guest" or cur=="viewer":
+        raise  HTTPException(403,"Not enough permissions")
+    
     if not settings:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -227,13 +252,16 @@ async def update_settings(
 
 @cam_route.post("/start")
 async def start_stream(
-    
+    current_user: Dict[str, Any] = Depends(get_current_user),
     port: Optional[str] = Query(None),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
     save_to_sd: bool = Query(True, description="Save photos to SD card"),
-    # _user=Depends(get_current_active_user),  # TODO: enable
+    # _user=Depends(get_current_user),  # TODO: enable
 ):
     """Start the camera live-view stream."""
+    cur=current_user.get("role")
+    if cur=="guest" or cur=="viewer":
+        raise  HTTPException(403,"Not enough permissions")
     if clsr.is_streaming:
         return {
             "status": "already_running",
@@ -263,11 +291,15 @@ async def start_stream(
 
 @cam_route.post("/stop")
 async def stop_stream(
+    current_user: Dict[str, Any] = Depends(get_current_user),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    # _user=Depends(get_current_active_user),  # TODO: enable
+    # _user=Depends(get_current_user),  # TODO: enable
 ):
     """Stop the camera live-view stream."""
     try:
+        cur=current_user.get("role")
+        if cur=="guest" or cur=="viewer":
+            raise  HTTPException(403,"Not enough permissions")
         await clsr.stop_streaming()
     except Exception as exc:
         raise _map_hardware_error(exc)
@@ -276,14 +308,18 @@ async def stop_stream(
 
 @cam_route.get("/livestream")
 async def live_stream(
+    current_user: Dict[str, Any] = Depends(get_current_user),
     port: Optional[str] = Query(None),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    # _user=Depends(get_current_active_user),  # TODO: enable
+    # _user=Depends(get_current_user),  # TODO: enable
 ):
     """
     MJPEG live-stream endpoint.
     Auto-starts the stream if not already running.
     """
+    cur=current_user.get("role")
+    if cur=="guest" or cur=="viewer":
+        raise  HTTPException(403,"Not enough permissions")
     if not clsr.is_streaming:
         try:
             success = await clsr.start_streaming(port)
@@ -307,9 +343,13 @@ async def live_stream(
 
 @cam_route.get("/status")
 async def stream_status(
+    current_user: Dict[str, Any] = Depends(get_current_user),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    # _user=Depends(get_current_active_user),  # TODO: enable
+    # _user=Depends(get_current_user),  # TODO: enable
 ):
+    cur=current_user.get("role")
+    if cur=="guest" or cur=="viewer":
+        raise  HTTPException(403,"Not enough permissions")
     """Return full camera and stream status, including circuit-breaker state."""
     info = clsr.get_status()
     return {
@@ -324,15 +364,19 @@ async def stream_status(
 
 @cam_route.post("/capture")
 async def capture_photo(
+    current_user: Dict[str, Any] = Depends(get_current_user),
     keep_on_sd: bool = Query(False, description="Retain image on SD card after download"),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    # _user=Depends(get_current_active_user),  # TODO: enable
+    # _user=Depends(get_current_user),  # TODO: enable
 ):
     """
     Capture a full-resolution photo and return it as a binary response.
     Basic image metrics are included as X-Image-* response headers.
     """
     try:
+        cur=current_user.get("role")
+        if cur=="guest" or cur=="viewer":
+            raise  HTTPException(403,"Not enough permissions")
         await _ensure_connected(clsr)
 
         # capture_photo() returns (bytes, str) — metadata is logged in DLSR_Helper
@@ -365,23 +409,25 @@ async def capture_photo(
             },
         )
 
-    except HTTPException:
-        raise
     except Exception as exc:
         raise _map_hardware_error(exc)
 
 
 @cam_route.post("/capture/detailed")
 async def capture_photo_detailed(
+    current_user: Dict[str, Any] = Depends(get_current_user),
     keep_on_sd: bool = Query(False),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-    # _user=Depends(get_current_active_user),  # TODO: enable
+    # _user=Depends(get_current_user),  # TODO: enable
 ):
     """
     Capture a photo and return metadata + Base64-encoded image as JSON.
     Intended for clients that cannot handle binary responses.
     """
     try:
+        cur=current_user.get("role")
+        if cur=="guest" or cur=="viewer":
+            raise  HTTPException(403,"Not enough permissions")
         await _ensure_connected(clsr)
 
         image_bytes, filename = await clsr.capture_photo(keep_on_sd=keep_on_sd)
@@ -398,8 +444,6 @@ async def capture_photo_detailed(
             "image_data": base64.b64encode(image_bytes).decode("utf-8"),
         }
 
-    except HTTPException:
-        raise
     except Exception as exc:
         raise _map_hardware_error(exc)
 
@@ -410,6 +454,7 @@ async def capture_photo_detailed(
 
 @cam_route.get("/health")
 async def camera_health(
+    current_user: Dict[str, Any] = Depends(get_current_user),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
 ):
     """
@@ -417,6 +462,9 @@ async def camera_health(
     Returns 200 regardless of camera state so load-balancers don't cycle
     the process; the 'status' field conveys actual health.
     """
+    cur=current_user.get("role")
+    if cur=="guest" or cur=="viewer":
+        raise  HTTPException(403,"Not enough permissions")
     info = clsr.get_status()
     return {
         "status":           "healthy" if info["camera_connected"] else "unhealthy",
@@ -459,7 +507,10 @@ async def test_endpoint():
 # ---------------------------------------------------------------------------
 
 @cam_route.get("/select", response_class=HTMLResponse)
-async def camera_selection_page():
+async def camera_selection_page(current_user: Dict[str, Any] = Depends(get_current_user),):
+    cur=current_user.get("role")
+    if cur=="guest" or cur=="viewer":
+        raise  HTTPException(403,"Not enough permissions")
     """Minimal camera control web UI."""
     # API_PREFIX is injected server-side — no hard-coded paths in JS
     html = f"""<!DOCTYPE html>

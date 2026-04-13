@@ -1,12 +1,10 @@
 import json
 import os
 from datetime import datetime
-from typing import Dict, List, Optional
-
+from typing import Dict, List, Optional,Any
+from App.api.dependencies.auth import get_current_user
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import Response
-
-from App.api.dependencies.auth import get_current_active_user
 from App.api.dependencies.camera import get_camera_streamer, CameraLiveViewStreamer
 from App.core.LoggingInit import get_core_logger
 
@@ -19,10 +17,14 @@ camsd_route = APIRouter(prefix="/sd", tags=["DSLR_Storage"])
 
 @camsd_route.get("/list")
 async def list_sd_card(
+    current_user: Dict[str, Any] = Depends(get_current_user),
     folder: str = "/",
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-   # _user=Depends(get_current_active_user),
+   # _user=Depends(get_current_user),
 ):
+    cur=current_user.get("role")
+    if cur=="guest" or cur=="viewer":
+        raise  HTTPException(403,"Not enough permissions")
     """List contents of the camera's SD card."""
     if not clsr.get_status().get("camera_connected"):
         raise HTTPException(
@@ -35,9 +37,13 @@ async def list_sd_card(
 
 @camsd_route.get("/test")
 async def test_sd_card(
+    current_user: Dict[str, Any] = Depends(get_current_user),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-   # _user=Depends(get_current_active_user),
+   # _user=Depends(get_current_user),
 ):
+    cur=current_user.get("role")
+    if cur=="guest" or cur=="viewer":
+        raise  HTTPException(403,"Not enough permissions")
     """Test SD card access."""
     results: Dict = {
         "status": "testing",
@@ -77,12 +83,16 @@ async def test_sd_card(
 
 @camsd_route.get("/search")
 async def search_images(
+    current_user: Dict[str, Any] = Depends(get_current_user),
     folder: str = "/",
     recursive: bool = True,
     extensions: Optional[str] = None,
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-   # _user=Depends(get_current_active_user),
+   # _user=Depends(get_current_user),
 ):
+    cur=current_user.get("role")
+    if cur=="guest" or cur=="viewer":
+        raise  HTTPException(403,"Not enough permissions")
     """Search for images on SD card."""
     ext_list = [e.strip().lower() for e in extensions.split(",")] if extensions else None
     images = await clsr.search_images(folder, recursive, ext_list)
@@ -97,9 +107,13 @@ async def search_images(
 @camsd_route.get("/download")
 async def download_sd_image(
     file_path: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-   # _user=Depends(get_current_active_user),
+   # _user=Depends(get_current_user),
 ):
+    cur=current_user.get("role")
+    if cur=="guest" or cur=="viewer":
+        raise  HTTPException(403,"Not enough permissions")
     """Download an image from SD card by absolute path."""
     file_data, filename, metadata = await clsr.download_image_by_path(file_path)
 
@@ -130,8 +144,12 @@ async def get_image_thumbnail(
     width: int = 320,
     height: int = 240,
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-   # _user=Depends(get_current_active_user),
+    current_user: Dict[str, Any] = Depends(get_current_user)
+   # _user=Depends(get_current_user),
 ):
+    cur=current_user.get("role")
+    if cur=="guest" or cur=="viewer":
+        raise  HTTPException(403,"Not enough permissions")
     """Get an embedded EXIF thumbnail from the camera."""
     folder = os.path.dirname(file_path) if "/" in file_path else "/"
     filename = os.path.basename(file_path) if "/" in file_path else file_path
@@ -147,8 +165,12 @@ async def get_image_thumbnail(
 async def batch_download_images(
     file_list: List[Dict],
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-   # _user=Depends(get_current_active_user),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+   # _user=Depends(get_current_user),
 ):
+    cur=current_user.get("role")
+    if cur=="guest" or cur=="viewer":
+        raise  HTTPException(403,"Not enough permissions")
     """Download multiple images. Returns a ZIP for >1 file."""
     results = await clsr.download_multiple_images(file_list)
     ok = [r for r in results if r["success"]]
@@ -186,8 +208,12 @@ async def batch_download_images(
 async def delete_sd_image(
     file_path: str,
     clsr: CameraLiveViewStreamer = Depends(get_camera_streamer),
-   # _user=Depends(get_current_active_user),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+   # _user=Depends(get_current_user),
 ):
+    cur=current_user.get("role")
+    if cur=="guest" or cur=="viewer" or cur=="user":
+        raise  HTTPException(403,"Not enough permissions")
     """Delete an image from the camera's SD card."""
     folder = os.path.dirname(file_path) if "/" in file_path else "/"
     filename = os.path.basename(file_path) if "/" in file_path else file_path

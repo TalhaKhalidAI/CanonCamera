@@ -11,12 +11,9 @@ logger = logging.getLogger(__name__)
 
 class UserRepository:
     """Repository for user database operations - NO SCHEMA DEPENDENCIES"""
-    
     def __init__(self, session: AsyncSession):
         self.session = session
-    
     # ========== BASIC CRUD ==========
-    
     async def get_by_id(self, user_id: int) -> Optional[UserModel]:
         """Get user by ID"""
         try:
@@ -27,7 +24,6 @@ class UserRepository:
         except Exception as e:
             logger.error(f"Error getting user by ID {user_id}: {e}")
             return None
-    
     async def get_by_email(self, email: str) -> Optional[UserModel]:
         """Get user by email"""
         try:
@@ -38,7 +34,6 @@ class UserRepository:
         except Exception as e:
             logger.error(f"Error getting user by email {email}: {e}")
             return None
-    
     async def get_by_name(self, name: str) -> Optional[UserModel]:
         """Get user by name"""
         try:
@@ -65,8 +60,9 @@ class UserRepository:
             await self.session.rollback()
             logger.error(f"Error creating user: {e}")
             return None
-    
-    async def update(self, user_id: int, update_data: Dict[str, Any]) -> Optional[UserModel]:
+    async def update(
+        self, user_id: int, update_data: Dict[str, Any]
+    ) -> Optional[UserModel]:
         """Update user with dictionary"""
         try:
             user = await self.get_by_id(user_id)
@@ -163,72 +159,70 @@ class UserRepository:
         return bool(user and user.disabled)
     
     async def search_users(
-        self, 
-        skip: int = 0, 
+        self,
+        skip: int = 0,
         limit: int = 100,
         active_only: bool = True,
-        search: Optional[str] = None
+        search: Optional[str] = None,
     ) -> List[UserModel]:
         """Search users with pagination"""
         try:
             query = select(UserModel)
-            
-            # Apply filters
+            # Apply filters (always exclude deleted by default)
             if active_only:
                 query = query.where(
                     and_(
                         UserModel.is_active == True,
-                        UserModel.disabled == False
+                        UserModel.disabled == False,
+                        UserModel.deleted == False,
                     )
                 )
-            
+            else:
+                # Still exclude deleted users even if active_only is False
+                # unless we specifically want to see the trash bin
+                query = query.where(UserModel.deleted == False)
             # Apply search
             if search:
                 search_filter = UserModel.name.ilike(f"%{search}%")
-                if '@' in search:  # Likely an email search
+                if "@" in search:  # Likely an email search
                     search_filter = search_filter | UserModel.email.ilike(f"%{search}%")
                 query = query.where(search_filter)
-            
             # Apply pagination and ordering
-            query = query.offset(skip).limit(limit).order_by(UserModel.created_at.desc())
-            
+            query = (
+                query.offset(skip).limit(limit).order_by(UserModel.created_at.desc())
+            )
             result = await self.session.execute(query)
             return result.scalars().all()
-            
         except Exception as e:
             logger.error(f"Error searching users: {e}")
             return []
-    
     async def count_users(self, active_only: bool = True) -> int:
         """Count total users"""
         try:
             query = select(UserModel)
-            
             if active_only:
                 query = query.where(
                     and_(
                         UserModel.is_active == True,
-                        UserModel.disabled == False
+                        UserModel.disabled == False,
+                        UserModel.deleted == False,
                     )
                 )
-            
+            else:
+                query = query.where(UserModel.deleted == False)
             result = await self.session.execute(query)
             return len(result.scalars().all())
-            
         except Exception as e:
             logger.error(f"Error counting users: {e}")
             return 0
-    
     async def exists_by_email(self, email: str) -> bool:
         """Check if user exists by email"""
         user = await self.get_by_email(email)
         return user is not None
-    
     async def get_with_profile(self, user_id: int) -> Optional[Tuple[UserModel, Any]]:
         """Get user with related profile data (if you have profiles)"""
         try:
             from sqlalchemy.orm import joinedload
-            
             result = await self.session.execute(
                 select(UserModel)
                 .options(joinedload(UserModel.profile))  # If you have relationship
@@ -238,27 +232,21 @@ class UserRepository:
         except Exception as e:
             logger.error(f"Error getting user with profile {user_id}: {e}")
             return None
-    
     # ========== UTILITIES ==========
-    
     def to_dict(self, user: UserModel, exclude: List[str] = None) -> Dict[str, Any]:
         """Convert SQLAlchemy model to dictionary (NO Pydantic dependency)"""
         if exclude is None:
             exclude = []
-        
         result = {}
         for column in user.__table__.columns:
             col_name = column.name
             if col_name not in exclude:
                 result[col_name] = getattr(user, col_name)
-        
         return result
-    
     def to_safe_dict(self, user: UserModel) -> Dict[str, Any]:
         """Convert to dictionary excluding sensitive fields"""
-        exclude_fields = ['password_hash', 'secret_key', 'token']
+        exclude_fields = ["password_hash", "secret_key", "token"]
         return self.to_dict(user, exclude=exclude_fields)
-    
     async def bulk_create(self, users_data: List[Dict[str, Any]]) -> List[UserModel]:
         """Create multiple users"""
         users = []
@@ -267,21 +255,16 @@ class UserRepository:
                 user = UserModel(**user_data)
                 self.session.add(user)
                 users.append(user)
-            
             await self.session.commit()
-            
             # Refresh all users
             for user in users:
                 await self.session.refresh(user)
-            
             logger.info(f"Created {len(users)} users")
             return users
-            
         except Exception as e:
             await self.session.rollback()
             logger.error(f"Error in bulk create: {e}")
             return []
-    
     async def bulk_update(self, user_updates: List[Tuple[int, Dict[str, Any]]]) -> int:
         """Bulk update users"""
         updated_count = 0
@@ -293,11 +276,9 @@ class UserRepository:
                         if hasattr(user, field):
                             setattr(user, field, value)
                     updated_count += 1
-            
             await self.session.commit()
             logger.info(f"Bulk updated {updated_count} users")
             return updated_count
-            
         except Exception as e:
             await self.session.rollback()
             logger.error(f"Error in bulk update: {e}")

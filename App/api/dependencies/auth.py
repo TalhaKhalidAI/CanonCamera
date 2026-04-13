@@ -196,6 +196,13 @@ async def get_current_user(
                 detail="User not found"
             )
         
+        if user.deleted:
+            logger.warning(f"Deleted user tried to authenticate: {user_id}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account is deleted"
+            )
+            
         if user.disabled or not user.is_active:
             logger.warning(f"Inactive user tried to authenticate: {user_id}")
             raise HTTPException(
@@ -211,7 +218,8 @@ async def get_current_user(
             "name": user.name,
             "role": user.user_role,
             "is_active": user.is_active,
-            "disabled": user.disabled
+            "disabled": user.disabled,
+            "deleted": user.deleted
         }
         
     except HTTPException:
@@ -270,6 +278,10 @@ async def authenticate_user(
             return None
         
         # Check if active
+        if user.deleted:
+            logger.debug(f"Authentication failed: account deleted - {uname}")
+            return None
+            
         if user.disabled or not user.is_active:
             logger.debug(f"Authentication failed: account disabled - {uname}")
             return None
@@ -345,7 +357,7 @@ async def refresh_access_token(refresh_token: str, db: AsyncSession) -> Optional
         repo = UserRepository(db)
         user = await repo.get_by_id(user_id)
         
-        if not user or user.disabled or not user.is_active:
+        if not user or user.deleted or user.disabled or not user.is_active:
             return None
         
         # Create new access token

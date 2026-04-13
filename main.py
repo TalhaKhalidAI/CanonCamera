@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 import os
-from fastapi import FastAPI, status, Request
+from fastapi import FastAPI, status, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -43,7 +43,7 @@ async def lifespan(app: FastAPI):
     logger.info("App shutting down...")
 
 
-app = FastAPI(title="Photo Booth", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Photo Booth", version="2.3.3", lifespan=lifespan)
 
 # State and Exception Handlers
 app.state.limiter = limiter
@@ -88,6 +88,9 @@ async def kill_switch_middleware(request: Request, call_next):
     try:
         response = await call_next(request)
         return response
+    except HTTPException:
+        # Standard API exceptions shouldn't trigger auto-kill
+        raise
     except Exception as e:
         logger.error(
             f"CRITICAL: Unhandled exception detected. Triggering AUTO-KILL. Error: {e}"
