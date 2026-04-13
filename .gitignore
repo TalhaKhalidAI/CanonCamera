@@ -40,3 +40,4 @@ logs
 *.key
 *.csr
 keys
+*.dbml
