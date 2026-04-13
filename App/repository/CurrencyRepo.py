@@ -68,6 +68,10 @@ class CurrencyRepository:
             logger.error(f"Error listing currencies: {e}")
             return []
 
+    async def get_all(self) -> List[Currencies]:
+        """Fetch all non-deleted currencies."""
+        return await self.list_all(include_deleted=False)
+
     async def get_available(self) -> List[Currencies]:
         """Get all currencies that are active, not disabled, and not deleted."""
         try:
