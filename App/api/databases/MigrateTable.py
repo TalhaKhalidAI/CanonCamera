@@ -1,5 +1,5 @@
 # App/models/user.py
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, func,VARCHAR,DECIMAL,FLOAT,ForeignKey,Float,Text,BigInteger,Numeric
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, func, VARCHAR, DECIMAL, FLOAT, ForeignKey, Float, Text, BigInteger, Numeric, UniqueConstraint
 from sqlalchemy.orm import relationship
 from App.core.Connector import Base  # Import from new connector
 from sqlalchemy.dialects.postgresql import JSONB
@@ -67,11 +67,18 @@ class eventShares(Base):
     event_id=Column(Integer,ForeignKey(Events.id),nullable=False)
     user_id=Column(Integer,ForeignKey(User.id),nullable=False)
     permission=Column(VARCHAR,nullable=False,default="viewer")
+    granted_by=Column(Integer,ForeignKey(User.id),nullable=True)       # who granted this access
+    access_date=Column(DateTime(timezone=True),server_default=func.now(),nullable=True)  # when access was granted
     is_active=Column(Boolean,nullable=False,default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), nullable=True)
     disabled=Column(Boolean,default=False)
     deleted=Column(Boolean,default=False,nullable=False)
+
+    __table_args__ = (
+        # Enforces one share record per user per event — required for ON CONFLICT DO UPDATE
+        UniqueConstraint("event_id", "user_id", name="uq_event_shares_event_user"),
+    )
 
 
 class printerConfig(Base):
