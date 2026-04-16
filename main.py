@@ -43,7 +43,7 @@ async def lifespan(app: FastAPI):
     logger.info("App shutting down...")
 
 
-app = FastAPI(title="Photo Booth", version="2.6.0", lifespan=lifespan)
+app = FastAPI(title="Photo Booth", version="2.7.1", lifespan=lifespan)
 6
 # State and Exception Handlers
 app.state.limiter = limiter
