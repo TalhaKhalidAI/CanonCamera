@@ -4,8 +4,7 @@ from sqlalchemy import select, update, delete, and_, or_, func
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 import logging
-import secrets
-import string
+import uuid
 
 from App.api.databases.MigrateTable import (
     Sessions,
@@ -28,24 +27,13 @@ class SessionRepo:
 
     # ========== HELPER METHODS ==========
 
-    def _generate_session_code(self, length: int = 8) -> str:
-        """Generate a unique session code."""
-        alphabet = string.ascii_uppercase + string.digits
-        return ''.join(secrets.choice(alphabet) for _ in range(length))
+    def _generate_session_code(self) -> str:
+        """Generate a unique session code using UUID4."""
+        return str(uuid.uuid4())
 
 
 
-    async def _session_exists(self, session_id: int) -> bool:
-        """Check if session exists and is not deleted."""
-        result = await self.session.execute(
-            select(Sessions.id).where(
-                and_(
-                    Sessions.id == session_id,
-                    Sessions.deleted == False
-                )
-            )
-        )
-        return result.scalar_one_or_none() is not None
+
 
     # ========== CREATE OPERATIONS ==========
 
@@ -77,39 +65,25 @@ class SessionRepo:
             if not event_check.scalar():
                 raise ValueError(f"Active event with ID {event_id} not found")
 
-            from sqlalchemy.exc import IntegrityError
+            session_code = self._generate_session_code()
 
-            for attempt in range(10):
-                session_code = self._generate_session_code()
+            session = Sessions(
+                event_id=event_id,
+                session_code=session_code,
+                guest_name=guest_name.strip(),
+                guest_email=guest_email.lower().strip() if guest_email else None,
+                guest_phone=guest_phone,
+                guest_address=guest_address,
+                is_active=True,
+                disabled=False,
+                deleted=False
+            )
 
-                session = Sessions(
-                    event_id=event_id,
-                    session_code=session_code,
-                    guest_name=guest_name.strip(),
-                    guest_email=guest_email.lower().strip() if guest_email else None,
-                    guest_phone=guest_phone,
-                    guest_address=guest_address,
-                    is_active=True,
-                    disabled=False,
-                    deleted=False
-                )
-
-                self.session.add(session)
-                try:
-                    await self.session.commit()
-                    await self.session.refresh(session)
-                    logger.info(f"Created session '{session_code}' for event {event_id}")
-                    return session
-                except IntegrityError as e:
-                    await self.session.rollback()
-                    # Check if it's the session_code unique constraint
-                    error_msg = str(e).lower()
-                    if "unique" in error_msg and "session_code" in error_msg:
-                        logger.debug(f"Session code collision '{session_code}', retrying...")
-                        continue
-                    raise  # Propagate other DB constraint violations
-
-            raise RuntimeError("Failed to generate unique session code after 10 attempts")
+            self.session.add(session)
+            await self.session.commit()
+            await self.session.refresh(session)
+            logger.info(f"Created session '{session_code}' for event {event_id}")
+            return session
 
         except ValueError:
             raise
@@ -394,7 +368,7 @@ class SessionRepo:
     ) -> Optional[Sessions]:
         """Activate or deactivate a session."""
         try:
-            session = await self.get_by_id(session_id, include_deleted=True)
+            session = await self.get_by_id(session_id, include_deleted=True, check_active=False)
             if not session:
                 raise ValueError(f"Session {session_id} not found")
 
@@ -466,6 +440,10 @@ class SessionRepo:
     async def delete_session(self, session_id: int, hard_delete: bool = False) -> bool:
         """Delete a session (soft or hard)."""
         try:
+            session = await self.get_by_id(session_id, check_active=False)
+            if not session:
+                raise ValueError(f"Session {session_id} not found")
+
             if hard_delete:
                 # Hard delete - remove all related records first
                 await self.session.execute(
@@ -486,10 +464,6 @@ class SessionRepo:
                     logger.info(f"Hard deleted session {session_id}")
                 return success
             else:
-                session = await self.get_by_id(session_id, check_active=False)
-                if not session:
-                    return False
-
                 if session.deleted:
                     return False
 
@@ -538,8 +512,8 @@ class SessionRepo:
                 )
             )
             if conflict.scalar():
-                # Generate new code for restored session
-                session.session_code = await self._generate_unique_code()
+                # Generate new code for restored session (UUID)
+                session.session_code = self._generate_session_code()
                 logger.warning(f"Session {session_id} restored with new code {session.session_code}")
 
             # Cascade restore child records
@@ -621,12 +595,16 @@ class SessionRepo:
             logger.error(f"Error getting session count: {e}")
             return 0
 
-    async def get_session_summary(self, session_id: int) -> Optional[Dict[str, Any]]:
-        """Get a summary of session with related counts."""
+    async def get_session_summary(self, session_id: int, only_active: bool = True) -> Optional[Dict[str, Any]]:
+        """Get a summary of session with related counts. If only_active is True, only return if session is not deleted or disabled."""
         try:
-            session = await self.get_by_id(session_id)
+            session = await self.get_by_id(session_id, check_active=False)
             if not session:
                 return None
+
+            if only_active and (session.deleted or session.disabled):
+                return None
+
 
             # Get photo count
             photo_count = await self.session.scalar(
