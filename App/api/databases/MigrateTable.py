@@ -98,7 +98,7 @@ class Sessions(Base):
     __tablename__="sessions"
     id=Column(Integer,primary_key=True,index=True,autoincrement=True)
     event_id=Column(Integer,ForeignKey(Events.id),nullable=False)
-    session_code=Column(VARCHAR,nullable=False)
+    session_code=Column(VARCHAR, unique=True, index=True, nullable=False)
     guest_name=Column(VARCHAR,nullable=False)
     guest_email=Column(VARCHAR)
     guest_phone=Column(VARCHAR)

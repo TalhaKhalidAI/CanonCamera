@@ -41,3 +41,6 @@ logs
 *.csr
 keys
 *.dbml
+**.conda**
+.mypy_cache/**
+**.mypy_cache**
