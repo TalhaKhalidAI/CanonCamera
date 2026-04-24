@@ -33,15 +33,7 @@ class SessionRepo:
         alphabet = string.ascii_uppercase + string.digits
         return ''.join(secrets.choice(alphabet) for _ in range(length))
 
-    async def _generate_unique_code(self) -> str:
-        """Generate a unique session code that doesn't exist."""
-        while True:
-            code = self._generate_session_code()
-            existing = await self.session.execute(
-                select(Sessions.id).where(Sessions.session_code == code)
-            )
-            if not existing.scalar_one_or_none():
-                return code
+
 
     async def _session_exists(self, session_id: int) -> bool:
         """Check if session exists and is not deleted."""
@@ -85,28 +77,42 @@ class SessionRepo:
             if not event_check.scalar():
                 raise ValueError(f"Active event with ID {event_id} not found")
 
-            # Generate unique session code
-            session_code = await self._generate_unique_code()
+            from sqlalchemy.exc import IntegrityError
 
-            session = Sessions(
-                event_id=event_id,
-                session_code=session_code,
-                guest_name=guest_name.strip(),
-                guest_email=guest_email.lower().strip() if guest_email else None,
-                guest_phone=guest_phone,
-                guest_address=guest_address,
-                is_active=True,
-                disabled=False,
-                deleted=False
-            )
+            for attempt in range(10):
+                session_code = self._generate_session_code()
 
-            self.session.add(session)
-            await self.session.commit()
-            await self.session.refresh(session)
+                session = Sessions(
+                    event_id=event_id,
+                    session_code=session_code,
+                    guest_name=guest_name.strip(),
+                    guest_email=guest_email.lower().strip() if guest_email else None,
+                    guest_phone=guest_phone,
+                    guest_address=guest_address,
+                    is_active=True,
+                    disabled=False,
+                    deleted=False
+                )
 
-            logger.info(f"Created session '{session_code}' for event {event_id}")
-            return session
+                self.session.add(session)
+                try:
+                    await self.session.commit()
+                    await self.session.refresh(session)
+                    logger.info(f"Created session '{session_code}' for event {event_id}")
+                    return session
+                except IntegrityError as e:
+                    await self.session.rollback()
+                    # Check if it's the session_code unique constraint
+                    error_msg = str(e).lower()
+                    if "unique" in error_msg and "session_code" in error_msg:
+                        logger.debug(f"Session code collision '{session_code}', retrying...")
+                        continue
+                    raise  # Propagate other DB constraint violations
 
+            raise RuntimeError("Failed to generate unique session code after 10 attempts")
+
+        except ValueError:
+            raise
         except Exception as e:
             await self.session.rollback()
             logger.error(f"Error creating session: {e}")
