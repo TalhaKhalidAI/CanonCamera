@@ -1,6 +1,6 @@
 # settings.py - PostgreSQL version
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import SecretStr, Field, PostgresDsn, field_validator
+from pydantic import SecretStr, Field, PostgresDsn, field_validator,FilePath
 from typing import Optional, Any
 import os
 
@@ -23,6 +23,8 @@ class Settings(BaseSettings):
         description="Secret key for JWT token signing"
     )
     
+    MEDIA_PATH:FilePath=Field(default="/media")
+
     ALGORITHM: str = Field(
         default="HS256",
         pattern="^(HS256|HS384|HS512|RS256|RS384|RS512|ES256|ES384|ES512|PS256|PS384|PS512)$"
