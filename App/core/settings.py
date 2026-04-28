@@ -16,6 +16,19 @@ class Settings(BaseSettings):
         extra="ignore"
     )
     
+    ### Minio Endpoints Optional
+    MINIO_ACCESS_KEY: Optional[SecretStr] = Field(
+        default=None,
+        description="Minio Access key"
+    )
+    MINIO_SECRET_KEY: Optional[SecretStr] = Field(
+        default=None,
+        description="MInio secret key"
+    )
+    MINIO_URL: Optional[str] = Field(
+        default="127.0.0.1:9000",
+        description="Url with port 9000"
+    )
     # Security
     SECRET_KEY: Optional[SecretStr] = Field(
         default=None,
@@ -23,7 +36,7 @@ class Settings(BaseSettings):
         description="Secret key for JWT token signing"
     )
     
-    MEDIA_PATH:FilePath=Field(default="/media")
+    MEDIA_PATH: str = Field(default="./media", description="Local media directory path")
 
     ALGORITHM: str = Field(
         default="HS256",
