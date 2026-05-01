@@ -260,6 +260,11 @@ class PhotoShareRepo:
             if not share:
                 raise ShareNotFoundError(f"Share {share_id} not found")
 
+            if share.retry_count >= self._max_retries:
+                raise InvalidShareStateError(
+                    f"Max retries ({self._max_retries}) exceeded for share {share_id}"
+                )
+
             share.retry_count += 1
             share.last_retry_at = func.now()
             share.status = ShareStatus.FAILED.value
@@ -281,19 +286,24 @@ class PhotoShareRepo:
 
     async def soft_delete_share(self, share_id: int) -> bool:
         """Soft delete a share record."""
-        result = await self.session.execute(
-            select(PhotoShares)
-            .where(PhotoShares.id == share_id, PhotoShares.deleted.is_(false()))
-            .with_for_update()
-            .execution_options(timeout=self._default_timeout)
-        )
-        share = result.scalar_one_or_none()
-        if not share:
-            return False
+        async def _do_delete():
+            result = await self.session.execute(
+                select(PhotoShares)
+                .where(PhotoShares.id == share_id, PhotoShares.deleted.is_(false()))
+                .with_for_update()
+                .execution_options(timeout=self._default_timeout)
+            )
+            share = result.scalar_one_or_none()
+            if not share:
+                return False
 
-        share.deleted = True
-        share.is_active = False
-        share.updated_at = func.now()
-        await self.session.commit()
-        self._log("info", f"Soft deleted share {share_id}")
-        return True
+            share.deleted = True
+            share.is_active = False
+            share.updated_at = func.now()
+            return True
+
+        success = await self._with_deadlock_retry(_do_delete, "soft_delete_share")
+        if success:
+            await self.session.commit()
+            self._log("info", f"Soft deleted share {share_id}")
+        return success
