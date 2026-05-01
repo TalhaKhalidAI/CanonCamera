@@ -9,13 +9,28 @@ from uuid import uuid4
 from enum import Enum
 
 from sqlalchemy import and_, delete, func, select, update, text
-from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError, NoResultFound
+from sqlalchemy.exc import (
+    IntegrityError,
+    OperationalError,
+    SQLAlchemyError,
+    NoResultFound,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import false, true
 
 from App.api.databases.MigrateTable import (
-    Orders, OrderItems, Products, Photoes, Sessions, Events, Currencies, User,
-    PaymentTransactions, InventoryTransactions
+    Orders,
+    OrderItems,
+    Products,
+    Photoes,
+    Sessions,
+    Events,
+    Currencies,
+    User,
+    PaymentTransactions,
+    InventoryTransactions,
+    Refunds,
+    StockAlerts,
 )
 
 logger = logging.getLogger(__name__)
@@ -27,6 +42,7 @@ _PG_DEADLOCK_CODE = "40P01"
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
+
 
 class OrderStatus(str, Enum):
     PENDING = "pending"
@@ -66,6 +82,7 @@ class InventoryTransactionType(str, Enum):
 # Custom Exceptions
 # ---------------------------------------------------------------------------
 
+
 class OrderRepoError(Exception):
     pass
 
@@ -97,6 +114,7 @@ class InventoryTransactionNotFoundError(OrderRepoError):
 # ---------------------------------------------------------------------------
 # Repository
 # ---------------------------------------------------------------------------
+
 
 class OrderRepo:
     """
@@ -135,7 +153,7 @@ class OrderRepo:
                 if pg_code != _PG_DEADLOCK_CODE:
                     raise
                 if attempt < self._max_retries - 1:
-                    wait = (2 ** attempt) * 0.1
+                    wait = (2**attempt) * 0.1
                     self._log("warning", f"Deadlock in {operation}, retry in {wait}s")
                     await asyncio.sleep(wait)
                     await self.session.rollback()
@@ -152,14 +170,15 @@ class OrderRepo:
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             unique_id = str(uuid4())[:8].upper()
             order_number = f"ORD-{timestamp}-{unique_id}"
-            
+
             existing = await self.session.execute(
-                select(Orders.id).where(Orders.order_number == order_number)
+                select(Orders.id)
+                .where(Orders.order_number == order_number)
                 .execution_options(timeout=self._default_timeout)
             )
             if not existing.scalar():
                 return order_number
-        
+
         return f"ORD-{uuid4().hex[:16].upper()}"
 
     async def _validate_order_status(self, order: Orders, allowed: List[OrderStatus]):
@@ -264,19 +283,14 @@ class OrderRepo:
             )
             self.session.add(order_item)
 
-        await self._with_deadlock_retry(
-            self.session.commit,
-            operation="create_order"
-        )
+        await self._with_deadlock_retry(self.session.commit, operation="create_order")
         await self.session.refresh(order)
 
         self._log("info", f"Created order {order.order_number} with {len(items)} items")
         return order
 
     async def get_order_by_id(
-        self, 
-        order_id: int, 
-        include_deleted: bool = False
+        self, order_id: int, include_deleted: bool = False
     ) -> Optional[Orders]:
         """Get order by ID."""
         conditions = [Orders.id == order_id]
@@ -284,7 +298,8 @@ class OrderRepo:
             conditions.append(Orders.deleted.is_(false()))
 
         result = await self.session.execute(
-            select(Orders).where(and_(*conditions))
+            select(Orders)
+            .where(and_(*conditions))
             .execution_options(timeout=self._default_timeout)
         )
         return result.scalar_one_or_none()
@@ -292,10 +307,9 @@ class OrderRepo:
     async def get_order_by_number(self, order_number: str) -> Optional[Orders]:
         """Get order by order number."""
         result = await self.session.execute(
-            select(Orders).where(
-                Orders.order_number == order_number,
-                Orders.deleted.is_(false())
-            ).execution_options(timeout=self._default_timeout)
+            select(Orders)
+            .where(Orders.order_number == order_number, Orders.deleted.is_(false()))
+            .execution_options(timeout=self._default_timeout)
         )
         return result.scalar_one_or_none()
 
@@ -364,6 +378,7 @@ class OrderRepo:
 
     async def confirm_order(self, order_id: int) -> Orders:
         """Confirm order and reduce stock atomically with audit trail."""
+
         async def _do_confirm():
             order = await self._get_order_with_lock(order_id)
             await self._validate_order_status(order, [OrderStatus.PENDING])
@@ -379,29 +394,30 @@ class OrderRepo:
             if not items:
                 raise ValueError(f"Order {order_id} has no items")
 
-            # Atomic stock reduction and inventory audit
+            # Pessimistic lock + stock reduction with inventory audit
             for item in items:
-                result = await self.session.execute(
-                    update(Products)
+                # Lock the product row first to prevent overselling
+                product_result = await self.session.execute(
+                    select(Products)
                     .where(
                         Products.id == item.product_id,
                         Products.deleted.is_(false()),
-                        Products.stock_count >= item.quantity
                     )
-                    .values(
-                        stock_count=Products.stock_count - item.quantity,
-                        updated_at=func.now()
-                    )
+                    .with_for_update()
+                    .execution_options(timeout=self._default_timeout)
                 )
-                if result.rowcount == 0:
-                    product = await self.session.execute(
-                        select(Products.name).where(Products.id == item.product_id)
-                    )
-                    product_name = product.scalar() or f"ID {item.product_id}"
+                product = product_result.scalar_one_or_none()
+                if not product:
+                    raise ValueError(f"Product {item.product_id} not found")
+
+                if product.stock_count < item.quantity:
                     raise InsufficientStockError(
-                        f"Insufficient stock for product '{product_name}'. "
-                        f"Requested: {item.quantity}"
+                        f"Insufficient stock for product '{product.name}'. "
+                        f"Available: {product.stock_count}, Requested: {item.quantity}"
                     )
+
+                product.stock_count -= item.quantity
+                product.updated_at = func.now()
 
                 # Record inventory transaction
                 await self.create_inventory_transaction(
@@ -414,7 +430,7 @@ class OrderRepo:
                     order_id=order.id,
                     order_item_id=item.id,
                     photo_id=item.photo_id,
-                    created_by=order.created_by
+                    created_by=order.created_by,
                 )
 
             # Update order status
@@ -429,58 +445,147 @@ class OrderRepo:
         self._log("info", f"Confirmed order {order_id}")
         return order
 
-    async def update_order_status(
+    async def checkout_order(
         self,
         order_id: int,
-        status: OrderStatus,
-        cancel_reason: Optional[str] = None
+        payment_method: str,
+        processed_by: int,
+        provider_reference: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Full checkout flow:
+            1. Confirm order (deduct stock + inventory audit)
+            2. Create payment transaction
+            3. Mark payment as success
+            4. Update order payment_status → paid
+            5. Trigger stock alerts for depleted products
+
+        On payment failure, order remains confirmed but payment_status = failed.
+
+        Returns:
+            Dict with 'order' and 'payment_transaction' keys.
+        """
+        # Step 1: Confirm order (deducts stock atomically)
+        order = await self.confirm_order(order_id)
+
+        # Step 2: Create payment transaction
+        transaction = await self.create_payment_transaction(
+            order_id=order.id,
+            currency_id=order.currency_id,
+            method=payment_method,
+            amount=order.total_amount,
+            provider_reference=provider_reference,
+            processed_by=processed_by,
+        )
+
+        try:
+            # Step 3: Mark payment success
+            transaction = await self.mark_payment_success(
+                transaction_id=transaction.id,
+                provider_reference=provider_reference,
+            )
+
+            # Step 4: Update order payment status
+            order.payment_status = PaymentStatus.PAID.value
+            order.payment_method = payment_method
+            order.status = OrderStatus.PAID.value
+            order.updated_at = func.now()
+
+        except Exception as exc:
+            # Payment failed — mark transaction and order accordingly
+            self._log("error", f"Payment failed for order {order_id}: {exc}")
+            transaction = await self.mark_payment_failed(
+                transaction_id=transaction.id,
+                failure_reason=str(exc)[:500],
+            )
+            order.payment_status = PaymentStatus.FAILED.value
+            order.status = OrderStatus.PAYMENT_FAILED.value
+            order.updated_at = func.now()
+
+        # Step 5: Trigger stock alerts for each product in the order
+        items = await self.get_order_items(order_id)
+        for item in items:
+            await self._check_stock_alert(
+                event_id=order.event_id,
+                product_id=item.product_id,
+            )
+
+        # Single final commit — payment + stock alerts in one transaction
+        await self.session.commit()
+        await self.session.refresh(order)
+
+        self._log("info", f"Checkout complete for order {order.order_number}")
+        return {
+            "order": order,
+            "payment_transaction": transaction,
+        }
+
+    async def update_order_status(
+        self, order_id: int, status: OrderStatus, cancel_reason: Optional[str] = None
     ) -> Orders:
         """Update order status."""
+
         async def _do_update():
             order = await self._get_order_with_lock(order_id)
             order.status = status.value
             if cancel_reason:
                 order.cancel_reason = cancel_reason[:500]  # Truncate with warning
                 if len(cancel_reason) > 500:
-                    self._log("warning", f"Cancel reason truncated: original length {len(cancel_reason)}")
+                    self._log(
+                        "warning",
+                        f"Cancel reason truncated: original length {len(cancel_reason)}",
+                    )
             order.updated_at = func.now()
             return order
 
         # ✅ FIX: assign return value
-        order = await self._with_deadlock_retry(_do_update, operation="update_order_status")
+        order = await self._with_deadlock_retry(
+            _do_update, operation="update_order_status"
+        )
         await self.session.refresh(order)
         self._log("info", f"Order {order_id} status: {status.value}")
         return order
 
     async def cancel_order(
-        self, 
-        order_id: int, 
-        cancel_reason: str,
-        restore_stock: bool = True
+        self, order_id: int, cancel_reason: str, restore_stock: bool = True
     ) -> Orders:
         """Cancel order and optionally restore stock."""
+
         async def _do_cancel():
             order = await self._get_order_with_lock(order_id)
 
-            if order.status in [OrderStatus.CANCELLED.value, OrderStatus.COMPLETED.value]:
-                raise InvalidOrderStateError(f"Cannot cancel order with status {order.status}")
+            if order.status in [
+                OrderStatus.CANCELLED.value,
+                OrderStatus.COMPLETED.value,
+            ]:
+                raise InvalidOrderStateError(
+                    f"Cannot cancel order with status {order.status}"
+                )
 
             if restore_stock and order.status == OrderStatus.CONFIRMED.value:
                 items = await self.session.execute(
                     select(OrderItems)
-                    .where(OrderItems.order_id == order_id, OrderItems.deleted.is_(false()))
+                    .where(
+                        OrderItems.order_id == order_id, OrderItems.deleted.is_(false())
+                    )
                     .execution_options(timeout=self._bulk_timeout)
                 )
                 for item in items.scalars().all():
-                    await self.session.execute(
-                        update(Products)
-                        .where(Products.id == item.product_id, Products.deleted.is_(false()))
-                        .values(
-                            stock_count=Products.stock_count + item.quantity,
-                            updated_at=func.now()
+                    # Pessimistic lock on product row for safe stock restore
+                    prod_result = await self.session.execute(
+                        select(Products)
+                        .where(
+                            Products.id == item.product_id,
+                            Products.deleted.is_(false()),
                         )
+                        .with_for_update()
+                        .execution_options(timeout=self._default_timeout)
                     )
-                    
+                    prod = prod_result.scalar_one_or_none()
+                    if prod:
+                        prod.stock_count += item.quantity
+                        prod.updated_at = func.now()
+
                     await self.create_inventory_transaction(
                         event_id=order.event_id,
                         product_id=item.product_id,
@@ -492,7 +597,7 @@ class OrderRepo:
                         order_item_id=item.id,
                         photo_id=item.photo_id,
                         reason=f"Cancelled order: {cancel_reason[:200]}",
-                        created_by=order.created_by
+                        created_by=order.created_by,
                     )
 
             order.status = OrderStatus.CANCELLED.value
@@ -521,34 +626,50 @@ class OrderRepo:
             order.is_active = False
             order.updated_at = func.now()
             await self.session.commit()
-            
+
             self._log("info", f"Soft deleted order {order_id}")
             return True
         except OrderNotFoundError:
             return False
 
     async def hard_delete_order(self, order_id: int) -> bool:
-        """Hard delete an order (check all references first)."""
-        # ✅ Check order items
+        """Hard delete an order (check all references under FOR UPDATE lock)."""
+        # Lock the order row first to prevent race conditions
+        order = await self.session.execute(
+            select(Orders)
+            .where(Orders.id == order_id)
+            .with_for_update()
+            .execution_options(timeout=self._default_timeout)
+        )
+        if not order.scalar_one_or_none():
+            return False
+
+        # ✅ Check order items (under lock — no new refs can appear)
         items = await self.get_order_items(order_id)
         if items:
-            raise ValueError(f"Cannot hard delete order {order_id}: has {len(items)} order items")
-        
+            raise ValueError(
+                f"Cannot hard delete order {order_id}: has {len(items)} order items"
+            )
+
         # ✅ Check payment transactions
         payment = await self.get_payment_transaction_by_order(order_id)
         if payment:
-            raise ValueError(f"Cannot hard delete order {order_id}: has payment transaction")
-        
+            raise ValueError(
+                f"Cannot hard delete order {order_id}: has payment transaction"
+            )
+
         # ✅ Check inventory transactions
-        inv_transactions = await self.get_inventory_transactions_by_order(order_id, limit=1)
-        if inv_transactions:
-            raise ValueError(f"Cannot hard delete order {order_id}: has inventory transactions")
-        
-        result = await self.session.execute(
-            delete(Orders).where(Orders.id == order_id)
+        inv_transactions = await self.get_inventory_transactions_by_order(
+            order_id, limit=1
         )
+        if inv_transactions:
+            raise ValueError(
+                f"Cannot hard delete order {order_id}: has inventory transactions"
+            )
+
+        result = await self.session.execute(delete(Orders).where(Orders.id == order_id))
         await self.session.commit()
-        
+
         success = result.rowcount > 0
         if success:
             self._log("info", f"Hard deleted order {order_id}")
@@ -569,7 +690,8 @@ class OrderRepo:
             conditions.append(OrderItems.deleted.is_(false()))
 
         result = await self.session.execute(
-            select(OrderItems).where(and_(*conditions))
+            select(OrderItems)
+            .where(and_(*conditions))
             .execution_options(timeout=self._default_timeout)
         )
         return list(result.scalars().all())
@@ -577,10 +699,9 @@ class OrderRepo:
     async def get_order_item_by_id(self, order_item_id: int) -> Optional[OrderItems]:
         """Get order item by ID."""
         result = await self.session.execute(
-            select(OrderItems).where(
-                OrderItems.id == order_item_id,
-                OrderItems.deleted.is_(false())
-            ).execution_options(timeout=self._default_timeout)
+            select(OrderItems)
+            .where(OrderItems.id == order_item_id, OrderItems.deleted.is_(false()))
+            .execution_options(timeout=self._default_timeout)
         )
         return result.scalar_one_or_none()
 
@@ -594,6 +715,7 @@ class OrderRepo:
         print_id: Optional[int] = None,
     ) -> OrderItems:
         """Add item to order with FOR UPDATE lock."""
+
         async def _do_add():
             order = await self._get_order_with_lock(order_id)
             await self._validate_order_status(order, [OrderStatus.PENDING])
@@ -611,15 +733,28 @@ class OrderRepo:
             )
             self.session.add(order_item)
 
-            order.subtotal_amount += line_total
-            order.total_amount += line_total
-            order.updated_at = func.now()
+            # order.subtotal_amount += line_total
+            # order.total_amount += line_total
+            # order.updated_at = func.now()
+            subtotal = await self.session.scalar(
+                select(func.coalesce(func.sum(OrderItems.line_total), 0)).where(
+                    and_(
+                        OrderItems.order_id == order_id,
+                        OrderItems.deleted.is_(false()),
+                    )
+                )
+            ) or Decimal(0)
 
+            order.subtotal_amount = subtotal
+            order.total_amount = subtotal  # extend here when tax/discount added
+            order.updated_at = func.now()
             await self.session.flush()
             return order_item
 
         # ✅ FIX: assign return value
-        order_item = await self._with_deadlock_retry(_do_add, operation="add_order_item")
+        order_item = await self._with_deadlock_retry(
+            _do_add, operation="add_order_item"
+        )
         await self.session.refresh(order_item)
         self._log("info", f"Added item to order {order_id}")
         return order_item
@@ -630,31 +765,41 @@ class OrderRepo:
         new_quantity: int,
     ) -> OrderItems:
         """Update order item quantity with FOR UPDATE lock."""
+
         async def _do_update():
             order_item = await self._get_order_item_with_lock(order_item_id)
             order = await self._get_order_with_lock(order_item.order_id)
             await self._validate_order_status(order, [OrderStatus.PENDING])
 
             if new_quantity <= 0:
-                order.subtotal_amount -= order_item.line_total
-                order.total_amount -= order_item.line_total
                 order_item.deleted = True
             else:
-                old_total = order_item.line_total
                 new_line_total = order_item.unit_price * new_quantity
-                delta = new_line_total - old_total
-
                 order_item.quantity = new_quantity
                 order_item.line_total = new_line_total
-                order.subtotal_amount += delta
-                order.total_amount += delta
 
             order_item.updated_at = func.now()
+
+            # Recalculate totals from DB to avoid stale-read race condition
+            await self.session.flush()
+            subtotal = await self.session.scalar(
+                select(func.coalesce(func.sum(OrderItems.line_total), 0)).where(
+                    and_(
+                        OrderItems.order_id == order_item.order_id,
+                        OrderItems.deleted.is_(false()),
+                    )
+                )
+            ) or Decimal(0)
+
+            order.subtotal_amount = subtotal
+            order.total_amount = subtotal  # extend here when tax/discount added
             order.updated_at = func.now()
             return order_item
 
         # ✅ FIX: assign return value
-        order_item = await self._with_deadlock_retry(_do_update, operation="update_order_item_quantity")
+        order_item = await self._with_deadlock_retry(
+            _do_update, operation="update_order_item_quantity"
+        )
         await self.session.refresh(order_item)
         self._log("info", f"Updated order item {order_item_id}")
         return order_item
@@ -676,7 +821,7 @@ class OrderRepo:
             select(PaymentTransactions)
             .where(
                 PaymentTransactions.order_id == order_id,
-                PaymentTransactions.deleted.is_(false())  # ✅ Fixed: is_(false())
+                PaymentTransactions.deleted.is_(false()),  # ✅ Fixed: is_(false())
             )
             .execution_options(timeout=self._default_timeout)
         )
@@ -690,7 +835,7 @@ class OrderRepo:
             select(PaymentTransactions)
             .where(
                 PaymentTransactions.id == transaction_id,
-                PaymentTransactions.deleted.is_(false())
+                PaymentTransactions.deleted.is_(false()),
             )
             .execution_options(timeout=self._default_timeout)
         )
@@ -704,7 +849,7 @@ class OrderRepo:
             select(PaymentTransactions)
             .where(
                 PaymentTransactions.provider_reference == provider_reference,
-                PaymentTransactions.deleted.is_(false())
+                PaymentTransactions.deleted.is_(false()),
             )
             .execution_options(timeout=self._default_timeout)
         )
@@ -718,7 +863,7 @@ class OrderRepo:
             select(PaymentTransactions)
             .where(
                 PaymentTransactions.status == status.value,
-                PaymentTransactions.deleted.is_(false())
+                PaymentTransactions.deleted.is_(false()),
             )
             .order_by(PaymentTransactions.created_at.desc())
             .limit(limit)
@@ -733,7 +878,7 @@ class OrderRepo:
         method: str,
         amount: Decimal,
         provider_reference: Optional[str] = None,
-        processed_by: Optional[int] = None
+        processed_by: Optional[int] = None,
     ) -> PaymentTransactions:
         """Create a payment transaction record."""
         transaction = PaymentTransactions(
@@ -744,11 +889,11 @@ class OrderRepo:
             amount=amount,
             provider_reference=provider_reference,
             processed_by=processed_by,
-            deleted=False
+            deleted=False,
         )
         self.session.add(transaction)
         await self.session.flush()
-        
+
         self._log("info", f"Created payment transaction for order {order_id}")
         return transaction
 
@@ -757,59 +902,64 @@ class OrderRepo:
         transaction_id: int,
         status: PaymentTransactionStatus,
         failure_reason: Optional[str] = None,
-        provider_reference: Optional[str] = None
+        provider_reference: Optional[str] = None,
     ) -> PaymentTransactions:
         """Update payment transaction status."""
+
         async def _do_update():
             result = await self.session.execute(
                 update(PaymentTransactions)
                 .where(
                     PaymentTransactions.id == transaction_id,
-                    PaymentTransactions.deleted.is_(false())
+                    PaymentTransactions.deleted.is_(false()),
                 )
                 .values(
                     status=status.value,
                     failure_reason=failure_reason,
-                    provider_reference=provider_reference if provider_reference else PaymentTransactions.provider_reference,
+                    provider_reference=provider_reference
+                    if provider_reference
+                    else PaymentTransactions.provider_reference,
                     processed_at=func.now(),
-                    updated_at=func.now()
+                    updated_at=func.now(),
                 )
                 .returning(PaymentTransactions)
             )
             # ✅ FIX: use scalar_one_or_none() and check
             transaction = result.scalar_one_or_none()
             if transaction is None:
-                raise PaymentTransactionNotFoundError(f"Transaction {transaction_id} not found")
+                raise PaymentTransactionNotFoundError(
+                    f"Transaction {transaction_id} not found"
+                )
             return transaction
-        
-        transaction = await self._with_deadlock_retry(_do_update, operation="update_payment_transaction")
+
+        transaction = await self._with_deadlock_retry(
+            _do_update, operation="update_payment_transaction"
+        )
         await self.session.refresh(transaction)
-        
-        self._log("info", f"Payment transaction {transaction_id} status: {status.value}")
+
+        self._log(
+            "info", f"Payment transaction {transaction_id} status: {status.value}"
+        )
         return transaction
 
     async def mark_payment_success(
-        self,
-        transaction_id: int,
-        provider_reference: Optional[str] = None
+        self, transaction_id: int, provider_reference: Optional[str] = None
     ) -> PaymentTransactions:
         """Mark payment as successful."""
         return await self.update_payment_transaction_status(
             transaction_id=transaction_id,
             status=PaymentTransactionStatus.SUCCESS,
-            provider_reference=provider_reference
+            provider_reference=provider_reference,
         )
 
     async def mark_payment_failed(
-        self,
-        transaction_id: int,
-        failure_reason: str
+        self, transaction_id: int, failure_reason: str
     ) -> PaymentTransactions:
         """Mark payment as failed."""
         return await self.update_payment_transaction_status(
             transaction_id=transaction_id,
             status=PaymentTransactionStatus.FAILED,
-            failure_reason=failure_reason
+            failure_reason=failure_reason,
         )
 
     async def soft_delete_payment_transaction(self, transaction_id: int) -> bool:
@@ -818,12 +968,12 @@ class OrderRepo:
             update(PaymentTransactions)
             .where(
                 PaymentTransactions.id == transaction_id,
-                PaymentTransactions.deleted.is_(false())
+                PaymentTransactions.deleted.is_(false()),
             )
             .values(deleted=True, updated_at=func.now())
         )
         await self.session.commit()
-        
+
         success = result.rowcount > 0
         if success:
             self._log("info", f"Soft deleted payment transaction {transaction_id}")
@@ -845,7 +995,7 @@ class OrderRepo:
         order_item_id: Optional[int] = None,
         photo_id: Optional[int] = None,
         reason: Optional[str] = None,
-        created_by: Optional[int] = None
+        created_by: Optional[int] = None,
     ) -> InventoryTransactions:
         """Record inventory transaction for audit trail."""
         transaction = InventoryTransactions(
@@ -860,26 +1010,26 @@ class OrderRepo:
             photo_id=photo_id,
             reason=reason,
             created_by=created_by,
-            deleted=False
+            deleted=False,
         )
         self.session.add(transaction)
         await self.session.flush()
-        
-        self._log("info", f"Inventory transaction: {transaction_type} x{quantity_change} for product {product_id}")
+
+        self._log(
+            "info",
+            f"Inventory transaction: {transaction_type} x{quantity_change} for product {product_id}",
+        )
         return transaction
 
     async def get_inventory_transactions_by_product(
-        self,
-        product_id: int,
-        limit: int = 100,
-        offset: int = 0
+        self, product_id: int, limit: int = 100, offset: int = 0
     ) -> List[InventoryTransactions]:
         """Get inventory transactions for a product."""
         result = await self.session.execute(
             select(InventoryTransactions)
             .where(
                 InventoryTransactions.product_id == product_id,
-                InventoryTransactions.deleted == False
+                InventoryTransactions.deleted.is_(false()),
             )
             .order_by(InventoryTransactions.created_at.desc())
             .limit(limit)
@@ -889,16 +1039,14 @@ class OrderRepo:
         return list(result.scalars().all())
 
     async def get_inventory_transactions_by_order(
-        self,
-        order_id: int,
-        limit: int = 100
+        self, order_id: int, limit: int = 100
     ) -> List[InventoryTransactions]:
         """Get inventory transactions for an order."""
         result = await self.session.execute(
             select(InventoryTransactions)
             .where(
                 InventoryTransactions.order_id == order_id,
-                InventoryTransactions.deleted == False
+                InventoryTransactions.deleted.is_(false()),
             )
             .order_by(InventoryTransactions.created_at.desc())
             .limit(limit)
@@ -907,16 +1055,14 @@ class OrderRepo:
         return list(result.scalars().all())
 
     async def get_inventory_transactions_by_type(
-        self,
-        transaction_type: InventoryTransactionType,
-        limit: int = 100
+        self, transaction_type: InventoryTransactionType, limit: int = 100
     ) -> List[InventoryTransactions]:
         """Get inventory transactions by type."""
         result = await self.session.execute(
             select(InventoryTransactions)
             .where(
                 InventoryTransactions.transaction_type == transaction_type.value,
-                InventoryTransactions.deleted == False
+                InventoryTransactions.deleted.is_(false()),
             )
             .order_by(InventoryTransactions.created_at.desc())
             .limit(limit)
@@ -924,54 +1070,48 @@ class OrderRepo:
         )
         return list(result.scalars().all())
 
-    async def get_product_inventory_summary(
-        self,
-        product_id: int
-    ) -> Dict[str, Any]:
+    async def get_product_inventory_summary(self, product_id: int) -> Dict[str, Any]:
         """Get inventory summary for a product."""
         result = await self.session.execute(
             select(
                 func.sum(InventoryTransactions.quantity_change).label("net_change"),
-                func.count().label("transaction_count")
+                func.count().label("transaction_count"),
             )
             .where(
                 InventoryTransactions.product_id == product_id,
-                InventoryTransactions.deleted == False
+                InventoryTransactions.deleted.is_(false()),
             )
             .execution_options(timeout=self._default_timeout)  # ✅ Added timeout
         )
         row = result.one()
-        
+
         return {
             "product_id": product_id,
             "net_change": row.net_change or 0,
-            "transaction_count": row.transaction_count or 0
+            "transaction_count": row.transaction_count or 0,
         }
 
-    async def get_event_inventory_summary(
-        self,
-        event_id: int
-    ) -> List[Dict[str, Any]]:
+    async def get_event_inventory_summary(self, event_id: int) -> List[Dict[str, Any]]:
         """Get inventory summary for all products in an event."""
         result = await self.session.execute(
             select(
                 InventoryTransactions.product_id,
                 func.sum(InventoryTransactions.quantity_change).label("net_change"),
-                func.count().label("transaction_count")
+                func.count().label("transaction_count"),
             )
             .where(
                 InventoryTransactions.event_id == event_id,
-                InventoryTransactions.deleted == False
+                InventoryTransactions.deleted.is_(false()),
             )
             .group_by(InventoryTransactions.product_id)
             .execution_options(timeout=self._bulk_timeout)  # ✅ Added timeout
         )
-        
+
         return [
             {
                 "product_id": row.product_id,
                 "net_change": row.net_change or 0,
-                "transaction_count": row.transaction_count or 0
+                "transaction_count": row.transaction_count or 0,
             }
             for row in result.all()
         ]
@@ -982,12 +1122,12 @@ class OrderRepo:
             update(InventoryTransactions)
             .where(
                 InventoryTransactions.id == transaction_id,
-                InventoryTransactions.deleted == False
+                InventoryTransactions.deleted.is_(false()),
             )
             .values(deleted=True)
         )
         await self.session.commit()
-        
+
         success = result.rowcount > 0
         if success:
             self._log("info", f"Soft deleted inventory transaction {transaction_id}")
@@ -1034,10 +1174,399 @@ class OrderRepo:
                     "status": payment.status if payment else None,
                     "method": payment.method if payment else None,
                     "amount": payment.amount if payment else None,
-                    "provider_reference": payment.provider_reference if payment else None,
-                } if payment else None,
+                    "provider_reference": payment.provider_reference
+                    if payment
+                    else None,
+                }
+                if payment
+                else None,
                 "item_count": len(items),
             }
         except SQLAlchemyError as e:
             self._log("error", f"Error getting order summary: {e}")
             return None
+
+    # ==================================================================
+    # REFUNDS - CRUD
+    # ==================================================================
+
+    async def create_refund(
+        self,
+        order_id: int,
+        payment_txn_id: int,
+        currency_id: int,
+        amount: Decimal,
+        reason: str,
+        approved_by: Optional[int] = None,
+        order_item_id: Optional[int] = None,
+    ) -> Refunds:
+        """
+        Create a refund record in pending state.
+
+        Does NOT update payment transaction status — call process_refund()
+        to atomically approve + update payment status together.
+
+        Raises:
+            OrderNotFoundError: order not found
+            PaymentTransactionNotFoundError: payment transaction not found
+            ValueError: amount exceeds order total or invalid input
+        """
+        if amount <= 0:
+            raise ValueError(f"Refund amount must be positive: {amount}")
+
+        order = await self.get_order_by_id(order_id)
+        if not order:
+            raise OrderNotFoundError(f"Order {order_id} not found")
+
+        txn = await self.get_payment_transaction_by_id(payment_txn_id)
+        if not txn:
+            raise PaymentTransactionNotFoundError(
+                f"Payment transaction {payment_txn_id} not found"
+            )
+
+        if amount > txn.amount:
+            raise ValueError(
+                f"Refund amount {amount} exceeds transaction amount {txn.amount}"
+            )
+
+        # Check cumulative refunds don't exceed transaction amount
+        existing_refunds = await self.session.scalar(
+            select(func.coalesce(func.sum(Refunds.amount), 0)).where(
+                and_(
+                    Refunds.payment_txn_id == payment_txn_id,
+                    Refunds.deleted.is_(false()),
+                    Refunds.status.in_(["pending", "approved", "processed"]),
+                )
+            )
+        ) or Decimal(0)
+
+        if existing_refunds + amount > txn.amount:
+            raise ValueError(
+                f"Total refunds ({existing_refunds + amount}) would exceed "
+                f"transaction amount ({txn.amount})"
+            )
+
+        # Validate order_item_id belongs to order_id if provided
+        if order_item_id:
+            item = await self.get_order_item_by_id(order_item_id)
+            if not item or item.order_id != order_id:
+                raise ValueError(
+                    f"Order item {order_item_id} does not belong to order {order_id}"
+                )
+
+        refund = Refunds(
+            order_id=order_id,
+            order_item_id=order_item_id,
+            payment_txn_id=payment_txn_id,
+            currency_id=currency_id,
+            amount=amount,
+            reason=reason,
+            status="pending",
+            approved_by=approved_by,
+            deleted=False,
+        )
+        self.session.add(refund)
+        await self.session.flush()
+        await self.session.commit()
+
+        self._log(
+            "info", f"Created refund id={refund.id} order={order_id} amount={amount}"
+        )
+        return refund
+
+    async def get_refund_by_id(
+        self,
+        refund_id: int,
+        include_deleted: bool = False,
+    ) -> Optional[Refunds]:
+        """Get refund by ID."""
+        conditions = [Refunds.id == refund_id]
+        if not include_deleted:
+            conditions.append(Refunds.deleted.is_(false()))
+
+        result = await self.session.execute(
+            select(Refunds)
+            .where(and_(*conditions))
+            .execution_options(timeout=self._default_timeout)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_refunds_by_order(
+        self,
+        order_id: int,
+        include_deleted: bool = False,
+    ) -> List[Refunds]:
+        """Get all refunds for an order."""
+        conditions = [Refunds.order_id == order_id]
+        if not include_deleted:
+            conditions.append(Refunds.deleted.is_(false()))
+
+        result = await self.session.execute(
+            select(Refunds)
+            .where(and_(*conditions))
+            .order_by(Refunds.created_at.desc())
+            .execution_options(timeout=self._default_timeout)
+        )
+        return list(result.scalars().all())
+
+    async def get_pending_refunds(self, limit: int = 100) -> List[Refunds]:
+        """Get all pending refunds awaiting approval."""
+        result = await self.session.execute(
+            select(Refunds)
+            .where(and_(Refunds.status == "pending", Refunds.deleted.is_(false())))
+            .order_by(Refunds.created_at.asc())
+            .limit(limit)
+            .execution_options(timeout=self._default_timeout)
+        )
+        return list(result.scalars().all())
+
+    async def approve_refund(
+        self,
+        refund_id: int,
+        approved_by: int,
+    ) -> Refunds:
+        """
+        Approve a pending refund.
+        Does not process it — call process_refund() to actually execute.
+
+        Raises:
+            OrderNotFoundError: refund not found
+            InvalidOrderStateError: refund is not in pending state
+        """
+        refund = await self.get_refund_by_id(refund_id)
+        if not refund:
+            raise OrderNotFoundError(f"Refund {refund_id} not found")
+
+        if refund.status != "pending":
+            raise InvalidOrderStateError(
+                f"Refund {refund_id} is '{refund.status}', expected 'pending'"
+            )
+
+        refund.status = "approved"
+        refund.approved_by = approved_by
+        refund.approved_at = func.now()
+
+        await self.session.commit()
+        await self.session.refresh(refund)
+
+        self._log("info", f"Approved refund {refund_id} by user {approved_by}")
+        return refund
+
+    async def process_refund(
+        self,
+        refund_id: int,
+        processed_by: int,
+        restore_stock: bool = False,
+    ) -> Refunds:
+        """
+        Process an approved refund atomically:
+            1. Mark refund as processed
+            2. Update PaymentTransaction status → refunded / partially_refunded
+            3. Optionally restore stock if order item is specified
+
+        All three happen in one transaction — if any step fails, all roll back.
+
+        Raises:
+            OrderNotFoundError: refund not found
+            InvalidOrderStateError: refund not in approved state
+            PaymentTransactionNotFoundError: linked transaction not found
+        """
+
+        async def _do_process():
+            refund = await self.session.scalar(
+                select(Refunds)
+                .where(Refunds.id == refund_id)
+                .with_for_update()
+                .execution_options(timeout=self._default_timeout)
+            )
+            if not refund:
+                raise OrderNotFoundError(f"Refund {refund_id} not found")
+
+            if refund.status != "approved":
+                raise InvalidOrderStateError(
+                    f"Refund {refund_id} is '{refund.status}', expected 'approved'"
+                )
+
+            # Update refund record
+            refund.status = "processed"
+            refund.processed_by = processed_by
+            refund.processed_at = func.now()
+
+            # Update payment transaction status
+            txn = await self.session.scalar(
+                select(PaymentTransactions)
+                .where(PaymentTransactions.id == refund.payment_txn_id)
+                .with_for_update()
+                .execution_options(timeout=self._default_timeout)
+            )
+            if not txn:
+                raise PaymentTransactionNotFoundError(
+                    f"Payment transaction {refund.payment_txn_id} not found"
+                )
+
+            # Check if this is a full or partial refund
+            total_refunded = await self.session.scalar(
+                select(func.coalesce(func.sum(Refunds.amount), 0)).where(
+                    and_(
+                        Refunds.payment_txn_id == refund.payment_txn_id,
+                        Refunds.deleted.is_(false()),
+                        Refunds.status == "processed",
+                    )
+                )
+            ) or Decimal(0)
+
+            # Include current refund in total (not yet committed)
+            total_refunded += refund.amount
+
+            txn.status = (
+                PaymentTransactionStatus.REFUNDED.value
+                if total_refunded >= txn.amount
+                else "partially_refunded"
+            )
+            txn.updated_at = func.now()
+
+            # Optionally restore stock for the specific order item
+            if restore_stock and refund.order_item_id:
+                item = await self.session.scalar(
+                    select(OrderItems)
+                    .where(OrderItems.id == refund.order_item_id)
+                    .execution_options(timeout=self._default_timeout)
+                )
+                if item:
+                    # Pessimistic lock on product row for safe stock restore
+                    refund_order = await self.session.scalar(
+                        select(Orders)
+                        .where(Orders.id == refund.order_id)
+                        .execution_options(timeout=self._default_timeout)
+                    )
+                    prod_result = await self.session.execute(
+                        select(Products)
+                        .where(
+                            Products.id == item.product_id,
+                            Products.deleted.is_(false()),
+                        )
+                        .with_for_update()
+                        .execution_options(timeout=self._default_timeout)
+                    )
+                    prod = prod_result.scalar_one_or_none()
+                    if prod:
+                        prod.stock_count += item.quantity
+                        prod.updated_at = func.now()
+
+                    # Audit trail
+                    await self.create_inventory_transaction(
+                        event_id=refund_order.event_id if refund_order else 0,
+                        product_id=item.product_id,
+                        currency_id=refund.currency_id,
+                        transaction_type=InventoryTransactionType.RETURN.value,
+                        quantity_change=item.quantity,
+                        unit_value=item.unit_price,
+                        order_id=refund.order_id,
+                        order_item_id=item.id,
+                        reason=f"Refund processed: refund_id={refund_id}",
+                        created_by=processed_by,
+                    )
+
+            await self.session.commit()
+            return refund
+
+        refund = await self._with_deadlock_retry(
+            _do_process, operation="process_refund"
+        )
+        await self.session.refresh(refund)
+
+        self._log("info", f"Processed refund {refund_id} by user {processed_by}")
+        return refund
+
+    async def soft_delete_refund(self, refund_id: int) -> bool:
+        """
+        Soft delete a refund. Only allowed for pending refunds —
+        processed refunds are financial records and must not be deleted.
+
+        Raises:
+            InvalidOrderStateError: refund is already processed or approved
+        """
+        refund = await self.get_refund_by_id(refund_id)
+        if not refund:
+            return False
+
+        if refund.status in ("approved", "processed"):
+            raise InvalidOrderStateError(
+                f"Cannot delete refund {refund_id} with status '{refund.status}'. "
+                "Only pending refunds can be deleted."
+            )
+
+        refund.deleted = True
+        await self.session.commit()
+
+        self._log("info", f"Soft deleted refund {refund_id}")
+        return True
+
+    async def _check_stock_alert(
+        self,
+        event_id: int,
+        product_id: int,
+    ) -> None:
+        """
+        After a stock change, check thresholds and create/update a StockAlert.
+        Called internally after every deduction or restoration.
+        """
+        row = await self.session.execute(
+            select(Products.stock_count, Products.low_stock_threshold, Products.name)
+            .where(and_(Products.id == product_id, Products.deleted.is_(false())))
+            .execution_options(timeout=self._default_timeout)
+        )
+        product = row.first()
+        if not product:
+            return
+
+        if product.stock_count == 0:
+            alert_type = "out_of_stock"
+        elif product.stock_count <= product.low_stock_threshold:
+            alert_type = "low_stock"
+        else:
+            # Stock is fine — resolve any existing unresolved alert
+            await self.session.execute(
+                update(StockAlerts)
+                .where(
+                    and_(
+                        StockAlerts.product_id == product_id,
+                        StockAlerts.event_id == event_id,
+                        StockAlerts.is_resolved.is_(false()),
+                        StockAlerts.deleted.is_(false()),
+                    )
+                )
+                .values(is_resolved=True, resolved_at=func.now())
+            )
+            return
+
+        # Check for an existing unresolved alert of this type
+        existing = await self.session.scalar(
+            select(StockAlerts.id)
+            .where(
+                and_(
+                    StockAlerts.product_id == product_id,
+                    StockAlerts.event_id == event_id,
+                    StockAlerts.alert_type == alert_type,
+                    StockAlerts.is_resolved.is_(false()),
+                    StockAlerts.deleted.is_(false()),
+                )
+            )
+            .limit(1)
+            .execution_options(timeout=self._default_timeout)
+        )
+
+        if not existing:
+            alert = StockAlerts(
+                event_id=event_id,
+                product_id=product_id,
+                alert_type=alert_type,
+                is_resolved=False,
+                deleted=False,
+            )
+            self.session.add(alert)
+            self._log(
+                "warning",
+                f"Stock alert created: {alert_type} product={product_id} "
+                f"stock={product.stock_count}",
+            )
